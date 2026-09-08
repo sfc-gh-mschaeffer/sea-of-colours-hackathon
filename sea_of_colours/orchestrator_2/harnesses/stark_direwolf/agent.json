@@ -1,0 +1,10 @@
+{
+  "team": "stark",
+  "name": "direwolf",
+  "participants": [
+    "Markus Schaeffer"
+  ],
+  "menu_label": "STARK_DIREWOLF \u2014 stark's agent (needs a Snowflake PAT \u00b7 slow)",
+  "entry": "harness:run",
+  "needs_llm": true
+}
