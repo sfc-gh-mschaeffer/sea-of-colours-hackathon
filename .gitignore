@@ -108,3 +108,8 @@ turnlab/data/*
 # has changed — so a parcel left in the repo root would block the
 # push it has nothing to do with.
 *.socfork
+
+# Cortex Code's own local plan-mode artifacts — IDE session state, not
+# game or agent code. Same reasoning as .socfork above: left untracked
+# it would block soc push for having nothing to do with the agent.
+.snowflake/
