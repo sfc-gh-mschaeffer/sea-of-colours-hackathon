@@ -840,4 +840,35 @@ __all__ = [
     "DOCTRINE_MULTIPROBE",
     "DOCTRINE_WEAPONS_ORBITAL",
     "DOCTRINE_WEAPONS_MULTIWAVE",
+    "DOCTRINE_WHITEWALKER_EMP",
 ]
+
+
+# Not injected into the live decision prompt — there is no decision to
+# persuade the model of. The "whitewalker EMP" opening strike (see
+# whitewalker.py) is forced deterministically by the harness, because
+# every doctrine block above this one exists to argue FOR firing and
+# prior art (docs/TEACHING_WEAPONS.md, harnesses/emp_harvest_test/)
+# found that argument loses to a menu option scoring +0 immediate yield,
+# every time. This block exists purely so a turn card or log reads as a
+# deliberate play rather than an unexplained EMP launch out of nowhere:
+# it is surfaced via the sanitizer/corrector note the turn it fires
+# (``corrector_notes`` in that day's memory entry, read back by
+# ``digest.py`` into the NEXT night's LAST NIGHT block — the ordinary
+# path every other sanitizer edit already takes, so the agent's own
+# later reasoning about its arsenal stays consistent with what actually
+# happened, with no extra plumbing).
+DOCTRINE_WHITEWALKER_EMP = """\
+WHITEWALKER EMP — the opening strike, already decided, not yours to choose:
+  This seat buys one EMP the moment blue and credits allow it (orbit priority
+  0, ahead of repairs/fleet/probes) and fires it the first night a real rival
+  probe is visible — freshest probes first, up to the missiles-per-launch cap.
+  Before that night arrives (including night 1, which never has rival probe
+  history to aim at), the harness steers that night's own probe placement
+  toward whichever destination reveals the most new fog instead of firing at
+  nothing. Both the purchase and the strike happen exactly once per game,
+  outside the option menu — there is nothing here for the plan pass to
+  select or reason about. If more EMPs are bought later, THOSE go through
+  the ordinary weapons doctrine above.
+"""
+

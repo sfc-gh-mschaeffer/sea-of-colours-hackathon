@@ -257,3 +257,106 @@ def _hydrate_from_snowflake(
 def clear_in_memory_store() -> None:
     """Test helper — reset the process-local cache between fixtures."""
     _IN_MEMORY_STORE.clear()
+
+
+# ── Once-per-game flags ──────────────────────────────────────────────
+#
+# The ``arena:day<N>`` entries above are all per-day narrative. Some
+# facts ("the scripted opening strike has already fired") don't belong
+# to any one day and need to survive a server restart the same way — so
+# they get their own row in the same table, keyed by ``kind =
+# "flag:<name>"`` instead of a day number.
+
+
+def _flag_key(session_id: str, player: str, flag_name: str) -> str:
+    return f"{session_id}::{player}::flag::{flag_name}"
+
+
+def set_flag(
+    session_id: str,
+    player: str,
+    flag_name: str,
+    value: Any = True,
+    *,
+    store: Optional[Any] = None,
+    season_name: Optional[str] = None,
+) -> None:
+    """Persist a once-per-game marker outside the per-day entries.
+
+    Best-effort against Snowflake, same contract as :func:`save_entry` —
+    a broken connection must not crash the turn that set the flag.
+    """
+    k = _flag_key(session_id, player, flag_name)
+    _IN_MEMORY_STORE[k] = {"value": value}
+    try:
+        from sea_of_colours.snowpark.backend import snowpark_session_for
+        session = snowpark_session_for(store)
+        if session is None:
+            return
+        payload = _json.dumps({"value": value}, default=str)
+        session.sql(
+            """
+            MERGE INTO SOC_AGENT_MEMORY t
+            USING (SELECT ? AS session_id, ? AS season_name, ? AS player,
+                          ? AS kind, PARSE_JSON(?) AS payload) s
+            ON t.session_id = s.session_id AND t.player = s.player
+                AND t.kind = s.kind
+            WHEN MATCHED THEN UPDATE SET payload = s.payload,
+                                         season_name = s.season_name,
+                                         updated_at = CURRENT_TIMESTAMP()
+            WHEN NOT MATCHED THEN INSERT (session_id, season_name, player,
+                                           kind, payload, updated_at)
+                VALUES (s.session_id, s.season_name, s.player, s.kind,
+                        s.payload, CURRENT_TIMESTAMP())
+            """,
+            params=[
+                session_id, season_name or "", player,
+                f"flag:{flag_name}", payload,
+            ],
+        ).collect()
+    except Exception:
+        # Never crash the turn on a memory-write failure.
+        pass
+
+
+def get_flag(
+    session_id: str,
+    player: str,
+    flag_name: str,
+    *,
+    default: Any = False,
+    store: Optional[Any] = None,
+) -> Any:
+    """Read a once-per-game marker, hydrating from Snowflake if needed.
+
+    Equality-only lookup on all three key columns
+    (``session_id``, ``player``, ``kind``) — safe on the hybrid table
+    unlike a ``LIKE``/``STARTSWITH`` scan (see ``_hydrate_from_snowflake``
+    for why that distinction matters here).
+    """
+    k = _flag_key(session_id, player, flag_name)
+    if k in _IN_MEMORY_STORE:
+        return _IN_MEMORY_STORE[k].get("value", default)
+    try:
+        from sea_of_colours.snowpark.backend import snowpark_session_for
+        session = snowpark_session_for(store)
+        if session is None:
+            return default
+        rows = session.sql(
+            """
+            SELECT PAYLOAD FROM SOC_AGENT_MEMORY
+            WHERE session_id = ? AND player = ? AND kind = ?
+            """,
+            params=[session_id, player, f"flag:{flag_name}"],
+        ).collect()
+        if rows:
+            payload = rows[0]["PAYLOAD"]
+            if isinstance(payload, str):
+                payload = _json.loads(payload)
+            if isinstance(payload, dict):
+                val = payload.get("value", default)
+                _IN_MEMORY_STORE[k] = {"value": val}
+                return val
+    except Exception:
+        pass
+    return default

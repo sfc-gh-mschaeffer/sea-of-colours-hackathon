@@ -141,8 +141,21 @@ def submit_orbit(
         from sea_of_colours.orchestrator_2.harnesses.stark_direwolf.orbit_policy import (
             plan_orbit_actions,
         )
+        from sea_of_colours.orchestrator_2.harnesses.stark_direwolf._v7 import (
+            memory as memory_mod,
+        )
         agent_view = view.get("agent_view") or view
-        actions, rationale = plan_orbit_actions(agent_view)
+        committed = memory_mod.get_flag(
+            session_id, player, "whitewalker_emp_committed", store=store,
+        )
+        actions, rationale, whitewalker_bought = plan_orbit_actions(
+            agent_view, whitewalker_committed=bool(committed),
+        )
+        if whitewalker_bought:
+            memory_mod.set_flag(
+                session_id, player, "whitewalker_emp_committed", True,
+                store=store,
+            )
         hud = agent_view.get("hud") or {}
         meta = agent_view.get("meta") or {}
         day = int(meta.get("day") or hud.get("day") or 0)

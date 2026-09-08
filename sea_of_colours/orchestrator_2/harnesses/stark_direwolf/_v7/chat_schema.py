@@ -40,9 +40,18 @@ _MOVE_ITEM = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "a": {"type": "string", "enum": ["drop", "step", "pickup", "probe"]},
+        "a": {
+            "type": "string",
+            "enum": ["drop", "step", "pickup", "probe", "emp_launch"],
+        },
         "unit": {"type": "string"},
-        "at": _CELL,
+        # Loose on purpose (module docstring: schema only guarantees rough
+        # shape, sanitizer + engine are the legality authority). Every
+        # other verb's ``at`` is one cell ``[x,y]``; ``emp_launch`` is a
+        # salvo of up to 3, ``[[x,y],[x,y],[x,y]]`` — dropping the strict
+        # ``items: integer`` constraint lets both through without a
+        # second field.
+        "at": {"type": "array"},
         "to": _CELL,
     },
     "required": ["a"],

@@ -85,6 +85,7 @@ from sea_of_colours.orchestrator_2.harnesses.stark_direwolf import (
     speculative as speculative_mod,
     supersede as supersede_mod,
     value_pyramid,
+    whitewalker as whitewalker_mod,
 )
 
 # ── Agent identity ─────────────────────────────────────────────────────
@@ -912,6 +913,56 @@ def run(
                     "swapped finisher plan -> heuristic (finisher banked ~no "
                     "reachable RED while chains were available)"
                 )
+
+    # 7b. WHITEWALKER EMP — the scripted, one-time opening strike (see
+    # whitewalker.py). Forced deterministically, bypassing the model
+    # entirely: a bare EMP salvo scores +0 immediate yield on the menu,
+    # so an LLM asked to pick the highest-scoring option never fires it
+    # (docs/TEACHING_WEAPONS.md). Only runs on the live path — the
+    # ADVISOR (submit=False) must not fire the seat's one-shot strike or
+    # mark it spent while a human is driving.
+    if submit and not whitewalker_mod.already_fired(session_id, player, store=store):
+        ww_targets: List[Any] = []
+        if whitewalker_mod.stock(agent_view) >= 1:
+            missiles = whitewalker_mod.missiles_per_launch(agent_view)
+            ww_targets, ww_notes = whitewalker_mod.rival_probe_targets(
+                agent_view, missiles=missiles,
+            )
+        if ww_targets:
+            # Hour 1, guaranteed: drop any emp_launch the model happened
+            # to propose on its own (there shouldn't be one yet — nothing
+            # offers it — but never double-fire) and prepend ours.
+            proposed = [m for m in proposed if not (
+                isinstance(m, Mapping) and str(m.get("a")) == "emp_launch"
+            )]
+            proposed = [
+                {"a": "emp_launch", "at": [[c[0], c[1]] for c in ww_targets]},
+            ] + proposed
+            whitewalker_mod.mark_fired(session_id, player, store=store)
+            sanitizer_log.append(
+                "WHITEWALKER: fired the opening-strike EMP at hour 1 — "
+                + "; ".join(ww_notes)
+            )
+        else:
+            # Nothing worth denying yet (no rival probe visible, or the
+            # EMP isn't bought yet) — steer tonight's own probe toward
+            # whichever destination reveals the most NEW fog instead of
+            # the harness's default pick.
+            best_probe = whitewalker_mod.least_overlap_probe(
+                probe_hints, agent_view,
+            )
+            if best_probe is not None:
+                target_cell = best_probe.get("at")
+                for i, m in enumerate(proposed):
+                    if isinstance(m, Mapping) and str(m.get("a")) == "probe":
+                        proposed[i] = {"a": "probe", "at": list(target_cell)}
+                        sanitizer_log.append(
+                            "WHITEWALKER: no rival probe visible yet — "
+                            f"steered tonight's probe to {list(target_cell)} "
+                            "(most new fog revealed) while the EMP waits "
+                            "for a real target"
+                        )
+                        break
 
     # 8. Cap + submit.
     final_moves = proposed[:_MAX_MOVES]

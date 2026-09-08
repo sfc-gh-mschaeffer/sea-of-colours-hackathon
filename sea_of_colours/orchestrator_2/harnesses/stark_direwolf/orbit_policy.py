@@ -81,7 +81,11 @@ class OrbitDials:
     harvester_build_cost: int = 1500
     harvester_cap: int = 3
     emp_blue_cost: int = 200
-    emp_credit_cost: int = 0
+    #: v1.45 fix — this used to default to 0, but the engine charges 250
+    #: (``EMP_COST_CREDITS`` in ``game/weapons.py``). Real prices come
+    #: from ``orbit.weapon_prices`` and win regardless; this fallback
+    #: only matters on a stripped-down test view.
+    emp_credit_cost: int = 250
     chaff_blue_cost: int = 300  # v1.36 — was 255
     chaff_credit_cost: int = 0
     #: Fallback for ``meta.rules.weapon_blue_cap`` (RULEBOOK §4.9.8) —
@@ -161,15 +165,21 @@ def plan_orbit_actions(
     *,
     weapons_enabled: bool = True,
     dials: OrbitDials = DEFAULT_DIALS,
-) -> Tuple[List[Dict[str, Any]], str]:
+    whitewalker_committed: bool = True,
+) -> Tuple[List[Dict[str, Any]], str, bool]:
     """Plan this seat's orbit submission (RULEBOOK §4).
 
-    Returns ``(actions, rationale)`` — wire-format orbit actions ready for
-    ``engine.submit_orbit_actions``, and the prose that lands on the card.
+    Returns ``(actions, rationale, whitewalker_bought)`` — wire-format
+    orbit actions ready for ``engine.submit_orbit_actions``, the prose
+    that lands on the card, and whether this call is the one that bought
+    the scripted opening strike's EMP (see priority 0 below).
 
     Pure spending in priority order, with no slot cap: credits and BLUE
     are the only limit.
 
+        0. Buy the "whitewalker EMP" opening strike's one EMP, the
+           moment it is affordable — before anything else, and only
+           once (see ``whitewalker_committed``).
         1. Repair every damaged harvester — a dead rig earns nothing.
         2. Build a harvester if under the fleet cap and affordable.
         3. Build weapons from surplus BLUE (skipped when disabled).
@@ -180,7 +190,14 @@ def plan_orbit_actions(
     fleet did not need.
 
     ``weapons_enabled=False`` is the no-weapons tutorial opponent
-    (RED_HARVEST_LITE) — it skips priority 3 and changes nothing else.
+    (RED_HARVEST_LITE) — it skips priorities 0 and 3 and changes nothing
+    else.
+
+    ``whitewalker_committed`` — set ``False`` by the caller (``orbit.py``)
+    until the scripted strike has been bought (or fired). Once bought,
+    the caller persists a flag and passes ``True`` forever after, so
+    priority 0 fires exactly once per game; every subsequent EMP/chaff
+    buy goes through the ordinary priority-3 economy below.
     """
     orbit = view.get("orbit") or {}
     credits = int(orbit.get("credits", 0))
@@ -206,10 +223,28 @@ def plan_orbit_actions(
     chaff_credit_cost = int(
         chaff_price.get("credits", dials.chaff_credit_cost),
     )
+    # v1.34 — the arsenal ceiling (RULEBOOK §4.9.8), needed by priority 0
+    # as well as priority 3, so it is computed once up top.
+    weapon_blue_cap = int(
+        ((view.get("meta") or {}).get("rules") or {}).get(
+            "weapon_blue_cap", dials.weapon_blue_cap
+        )
+    )
+    held_weapon_blue = 0
+    for kind, price in (weapon_prices or {}).items():
+        if not isinstance(price, Mapping):
+            continue
+        held_weapon_blue += (
+            int(weapon_stock.get(kind, 0) or 0) * int(price.get("blue", 0) or 0)
+        )
+
+    def _room_for(blue_cost: int) -> bool:
+        return held_weapon_blue + blue_cost <= weapon_blue_cap
 
     actions: List[Dict[str, Any]] = []
     descriptors: List[str] = []
     remaining = credits
+    whitewalker_bought = False
 
     # LEGACY PATH, KEPT ON PURPOSE (v1.30). A new season never reaches
     # here — the simulator settles the terminal orbit itself rather than
@@ -221,7 +256,29 @@ def plan_orbit_actions(
         return [], (
             "final settlement orbit: RED ships and GREEN clears "
             "automatically — nothing worth buying"
-        )
+        ), False
+
+    # Priority 0: the "whitewalker EMP" opening strike — buy the one EMP
+    # it fires, ahead of repairs/fleet/probes, the moment blue and
+    # credits allow it. Fires at most once per game; see harness.py /
+    # whitewalker.py for the night-phase targeting that spends it.
+    if weapons_enabled and not whitewalker_committed:
+        if blue_total >= emp_blue_cost and remaining >= emp_credit_cost and _room_for(
+            emp_blue_cost
+        ):
+            actions.append({"a": "build_emp", "count": 1})
+            remaining -= emp_credit_cost
+            held_weapon_blue += emp_blue_cost
+            whitewalker_bought = True
+            descriptors.append(
+                f"WHITEWALKER: bought the opening-strike EMP first "
+                f"(blue {blue_total}, {emp_credit_cost}c)"
+            )
+        else:
+            descriptors.append(
+                f"WHITEWALKER: EMP not yet affordable (blue {blue_total}/"
+                f"{emp_blue_cost}, credits {remaining}/{emp_credit_cost})"
+            )
 
     # Priority 1: repair every damaged harvester.
     for harv in [h for h in _my_harvesters(view) if bool(h.get("damaged"))]:
@@ -253,34 +310,9 @@ def plan_orbit_actions(
     # Priority 3: weapons, tiered on rolled-up BLUE. Chaff leads the
     # always-build band because an empty rack loses the egress jam, and
     # the jam is the cheapest denial in the game.
-    # v1.34 — the arsenal ceiling (RULEBOOK §4.9.8). Threaded through the
-    # affordability helpers so every branch below inherits it, rather
-    # than bolted onto each one. At most one weapon is queued per orbit,
-    # so the held figure does not need to move mid-plan.
-    weapon_blue_cap = int(
-        ((view.get("meta") or {}).get("rules") or {}).get(
-            "weapon_blue_cap", dials.weapon_blue_cap
-        )
-    )
-    # v1.38 — sum EVERY kind the game prices, not the two this policy
-    # happens to buy. It used to be ``emp_stock * emp + chaff_stock *
-    # chaff``, which stopped being the seat's arsenal the moment a third
-    # weapon existed: a seat holding two SNAPs read as 0 of 600, so the
-    # policy would cheerfully propose a build the engine then refused at
-    # the cap — the exact failure the descriptor below exists to avoid.
-    # Nothing is bought here that is not already bought below; this is
-    # only the arithmetic of what is already held.
-    held_weapon_blue = 0
-    for kind, price in (weapon_prices or {}).items():
-        if not isinstance(price, Mapping):
-            continue
-        held_weapon_blue += (
-            int(weapon_stock.get(kind, 0) or 0) * int(price.get("blue", 0) or 0)
-        )
-
-    def _room_for(blue_cost: int) -> bool:
-        return held_weapon_blue + blue_cost <= weapon_blue_cap
-
+    # v1.34 — the arsenal ceiling (RULEBOOK §4.9.8) and the held-blue
+    # tally are computed up top now (priority 0 needs them too); this
+    # section just consumes them via the closures below.
     def _afford_emp() -> bool:
         return (
             blue_total >= emp_blue_cost
@@ -379,4 +411,4 @@ def plan_orbit_actions(
         + "; ".join(descriptors)
         + f". Carryover {remaining}c."
     )
-    return actions, rationale
+    return actions, rationale, whitewalker_bought

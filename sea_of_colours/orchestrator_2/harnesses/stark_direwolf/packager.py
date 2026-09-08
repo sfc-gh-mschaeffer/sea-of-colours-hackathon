@@ -572,6 +572,22 @@ class _Packer:
         self.probe_budget -= 1
         return True
 
+    def spend_emp(self, targets: Sequence[Any]) -> bool:
+        """Launch one EMP salvo at up to 3 cells (RULEBOOK §4.9.3).
+
+        No budget tracked here — the charge itself was already paid for
+        in orbit (``orbit_policy.py``); this only spends the hour-slot.
+        Cells need not be occupied by anything: an EMP can target empty
+        ground.
+        """
+        cells = [c for c in (_cell(t) for t in (targets or [])) if c is not None]
+        if not cells:
+            return False
+        self.moves.append(
+            {"a": "emp_launch", "at": [[c[0], c[1]] for c in cells]}
+        )
+        return True
+
     # ── run transactions ───────────────────────────────────────────
     # A run is "spend the enabling probes, then emit the chain", and the probes
     # have to be emitted FIRST so their disks open before the drop. If the chain
@@ -809,6 +825,11 @@ def _pack_supersede(pk: _Packer, payload: Mapping[str, Any]) -> None:
         pk.log.append("cut supersede: no stock left")
 
 
+def _pack_emp(pk: _Packer, payload: Mapping[str, Any]) -> None:
+    if not pk.spend_emp(payload.get("targets") or []):
+        pk.log.append("cut EMP launch: no target cells")
+
+
 def _pack_frontier(pk: _Packer, payload: Mapping[str, Any]) -> None:
     at = _cell(payload.get("at"))
     if at is None:
@@ -859,6 +880,7 @@ _DISPATCH = {
     "probe": _pack_probe,
     "supersede": _pack_supersede,
     "frontier": _pack_frontier,
+    "emp": _pack_emp,
 }
 
 
