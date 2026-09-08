@@ -746,10 +746,13 @@ def _pushing_at_someone_elses_repo(remote: str) -> str | None:
         repo = fork_collect.upstream_of(url)
     except fork_collect.CollectError:
         return None
-    done = subprocess.run(
-        ["gh", "api", "user", "--jq", ".login"],
-        capture_output=True, text=True, check=False,
-    )
+    try:
+        done = subprocess.run(
+            ["gh", "api", "user", "--jq", ".login"],
+            capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        return None  # no gh installed — best-effort, not a blocker
     if done.returncode != 0:
         return None
     me = (done.stdout or "").strip().lower()

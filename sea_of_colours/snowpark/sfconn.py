@@ -41,7 +41,11 @@ from __future__ import annotations
 
 import os
 import sys
-import tomllib
+
+try:
+    import tomllib  # stdlib on 3.11+
+except ModuleNotFoundError:
+    import tomli as tomllib  # 3.10 backport
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
