@@ -42,6 +42,7 @@ from sea_of_colours.orchestrator_2.harnesses.stark_direwolf._v7.probe_hints impo
 from sea_of_colours.orchestrator_2.harnesses.stark_direwolf.supersede import (
     _enemy_probes,
 )
+from sea_of_colours.orchestrator_2.harnesses.stark_direwolf import rival_profile
 
 Cell = Tuple[int, int]
 
@@ -1440,6 +1441,24 @@ def collision_risk(
                 "harvesters on the pure, either staged (grab, then a late second "
                 "bite) or DROP BLOCK (below)"
             )
+        # Phase 2 (IMPROVEMENT_STRATEGIES_PHASE2.md §4) — weapon-timing
+        # prediction. Sharper than "a rival holds a weapon": WHEN they
+        # tend to use it, learned from their own past strikes on past
+        # redsigns. Derived from agent_view directly (session_id/player),
+        # the same pattern the Phase-1 denial-value rival-profile bump
+        # already uses in agency.py — no new plumbing.
+        if know["tier"] == "live" and watching_seats:
+            _meta = agent_view.get("meta") or {}
+            _session_id = str(_meta.get("session_id") or "")
+            _player = str(_meta.get("player") or (agent_view.get("hud") or {}).get("player") or "")
+            _strike_notes = []
+            for _seat in sorted(watching_seats):
+                _prof = rival_profile.get_profile(_session_id, _player, _seat)
+                _hour = _prof.get("typical_strike_hour")
+                if _hour is not None:
+                    _strike_notes.append(f"{_seat} typically strikes ~{_hour}h after a discovery")
+            if _strike_notes:
+                reason += "; TIMING — " + "; ".join(_strike_notes)
         if late and rivals >= 2 and know["tier"] == "live":
             level = "ULTRA HIGH"
             reason += (

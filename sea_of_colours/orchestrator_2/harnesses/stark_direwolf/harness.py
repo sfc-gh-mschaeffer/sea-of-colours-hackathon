@@ -82,6 +82,7 @@ from sea_of_colours.orchestrator_2.harnesses.stark_direwolf import (
     orbit as orbit_mod,
     packager,
     rival_profile as rival_profile_mod,
+    self_profile as self_profile_mod,
     seam_control as seam_control_mod,
     speculative as speculative_mod,
     supersede as supersede_mod,
@@ -410,6 +411,13 @@ def run(
     rival_profile_mod.record_turn(
         session_id, player, agent_view, store=store,
     )
+    # Phase 2 (IMPROVEMENT_STRATEGIES_PHASE2.md §4) — weapon-timing
+    # prediction: reuses the SAME last_night_memory already collected
+    # above (line 366) for the LAST NIGHT prompt block, no second replay
+    # read.
+    rival_profile_mod.record_strike_hours(
+        session_id, player, agent_view, last_night_memory, store=store,
+    )
     _anchored_labels = {"redsign", "blue_sign", "echo", "seam_extension"}
     anchored_probes = [
         h for h in probe_hints_mod.top_probe_hints(
@@ -551,6 +559,20 @@ def run(
     snap_targets: List[Any] = []
     if int(((agent_view.get("orbit") or {}).get("weapon_stock") or {}).get("snap", 0) or 0) >= 1:
         snap_targets = sorted(supersede_mod._redsign_finder_cells(agent_view))
+    # Phase 2 (IMPROVEMENT_STRATEGIES_PHASE2.md §5) — DROP BLOCK. A pure/
+    # mass cell we can see LIVE that a rival can ALSO see live right now
+    # (they could land here too this hour) — reuses value_pyramid's own
+    # live/echo split rather than a second red-cell scan, and
+    # rival_knowledge's existing tier computation rather than a third
+    # vision-overlap check.
+    _drop_block_seen: List[Any] = []
+    live_red, _ = value_pyramid._red_by_provenance(agent_view)
+    for _cell, _purity in live_red.items():
+        if _purity < value_pyramid._MASS_MIN:
+            continue
+        if econ_mod.rival_knowledge(agent_view, _cell, day).get("tier") == "live":
+            _drop_block_seen.append(_cell)
+    drop_block_targets = sorted(_drop_block_seen)[:5]
     option_registry = agency_mod.build_registry(
         agent_view=agent_view,
         seam_patterns=seam_patterns,
@@ -560,6 +582,7 @@ def run(
         supersede_hints=supersede_hints,
         snap_cover_hints=snap_cover_hints,
         snap_targets=snap_targets,
+        drop_block_targets=drop_block_targets,
         blue_requested=want_blue,
         harvesters_alive=harvesters_alive,
         hazard_cells=hazard_cells,
@@ -982,6 +1005,36 @@ def run(
 
     # 8. Cap + submit.
     final_moves = proposed[:_MAX_MOVES]
+    # Phase 3 (IMPROVEMENT_STRATEGIES_PHASE2.md §3) — self-predictability.
+    # Check BEFORE recording this turn (recording after would make every
+    # turn compare against itself). Enforce for free when safe (see
+    # maybe_jitter_pickup_hour's own docstring for the narrow, provably-
+    # safe case); otherwise report the risk rather than silently living
+    # with it or guessing at a riskier fix.
+    _self_profile = self_profile_mod.get_profile(session_id, player, store=store)
+    _predictable_hour = _self_profile.get("predictable_pickup_hour")
+    if _predictable_hour is not None:
+        final_moves, _jitter_applied = self_profile_mod.maybe_jitter_pickup_hour(
+            final_moves, _predictable_hour,
+        )
+        if _jitter_applied:
+            sanitizer_log.append(
+                f"SELF-PROFILE: your pickups have clustered at hour "
+                f"{_predictable_hour} recently — swapped tonight's two "
+                "harvester waves so neither lands there (same chains, "
+                "same value, just a different hour each lands on)"
+            )
+        elif _predictable_hour in self_profile_mod._pickup_hours(final_moves):
+            sanitizer_log.append(
+                f"SELF-PROFILE NOTE: your pickups have clustered at hour "
+                f"{_predictable_hour} recently, and tonight's plan lands "
+                "one there too — a rival modelling your rhythm the way "
+                "you model theirs could time a weapon to it. No safe "
+                "reorder was available (probes/weapons interleaved with "
+                "the harvester waves), so this is reported, not changed — "
+                "your call whether to adjust it"
+            )
+    self_profile_mod.record_turn(session_id, player, final_moves, store=store)
     if submit:
         v7h._record_moves(session_id, player, day, final_moves)
         from sea_of_colours.snowpark import engine as soc_engine

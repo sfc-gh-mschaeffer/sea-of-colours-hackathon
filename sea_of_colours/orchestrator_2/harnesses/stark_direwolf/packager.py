@@ -922,6 +922,12 @@ _DISPATCH = {
     "grab": _pack_chain,
     "blue_grab": _pack_chain,
     "chain": _pack_chain,
+    # Phase 2 (IMPROVEMENT_STRATEGIES_PHASE2.md §5) — DROP BLOCK is wire-
+    # identical to a 0-step juice chain (drop_at + empty cells): the
+    # engine, not the packager, decides at resolution whether it's a
+    # mutual-collision denial or a landing-damage spill. No new dispatch
+    # needed, same reuse pattern as "grab"/"blue_grab" above.
+    "drop_block": _pack_chain,
     "probe": _pack_probe,
     "supersede": _pack_supersede,
     "frontier": _pack_frontier,

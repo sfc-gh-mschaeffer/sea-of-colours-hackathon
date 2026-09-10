@@ -12,15 +12,16 @@ this module is the first thing that keeps a running tally of it per seat
 rather than reading it fresh and throwing it away every night.
 
 Deliberately narrow for a first cut: quadrant preference and redsign-contest
-rate, both built from data this harness already computes elsewhere. Skips
-weapon-firing-hour timing (also proposed in the strategy doc) — that needs a
-new per-hour event feed this pass didn't have time to wire up cleanly;
-noted as a follow-on rather than guessed at.
+rate, both built from data this harness already computes elsewhere.
+
+Phase 2 (IMPROVEMENT_STRATEGIES_PHASE2.md §4) added weapon-timing
+prediction — the complement to ``self_profile.py`` (there we protect
+ourselves from being profiled; here we exploit a rival's own rhythm).
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from sea_of_colours.orchestrator_2.harnesses.stark_direwolf._v7 import (
     memory as memory_mod,
@@ -31,6 +32,13 @@ from sea_of_colours.orchestrator_2.harnesses.stark_direwolf.supersede import (
 )
 
 _QUADRANTS = ("NW", "NE", "SW", "SE")
+_STRIKE_TAGS = ("emp_launch", "chaff_flare")
+#: Bounded history, matching opponent_weapons.py's own ``inferences``
+#: bounding — a rival's habits from 10 nights ago matter less than last
+#: night's, and an unbounded list is a slow memory leak over a long season.
+_MAX_STRIKE_SAMPLES = 10
+#: Below this many samples, "typical" is noise with a label.
+_MIN_SAMPLES_FOR_STRIKE_HOUR = 3
 
 
 def _quadrant(
@@ -123,8 +131,73 @@ def record_turn(
                 "quadrant_counts": quadrant_counts,
                 "sightings": sightings,
                 "redsign_finder_sightings": finder_sightings,
+                # Preserve whatever record_strike_hours already wrote —
+                # this is a read-modify-write over the SAME flag, and
+                # overwriting the dict wholesale here would silently drop
+                # the other function's field.
+                "strike_hour_offsets": profile.get("strike_hour_offsets") or [],
             },
             store=store,
+        )
+
+
+def record_strike_hours(
+    session_id: str, player: str, agent_view: Mapping[str, Any],
+    last_night_memory: Optional[Mapping[str, Any]],
+    *, store: Optional[Any] = None,
+) -> None:
+    """Learn WHEN a rival tends to strike relative to a redsign's discovery.
+
+    Phase 2 (IMPROVEMENT_STRATEGIES_PHASE2.md §4). Reads
+    ``last_night_memory["execution_log"]`` — the SAME per-hour log
+    ``last_night_mod.collect()`` already assembles from replay frames for
+    the LAST NIGHT prompt block, no second intel path — filtered to
+    ``kind == "enemy"`` and a weapon-launch tag. Correlates each such
+    event's hour against the EARLIEST redsign discovered on that SAME day
+    (``agent_view["redsign"]`` rows whose own ``day`` matches the log's
+    day) — cross-day correlation is deliberately skipped: hour numbering
+    resets every night, so an offset spanning two different nights isn't
+    a single number.
+    """
+    exec_log = (last_night_memory or {}).get("execution_log") or []
+    day_ended = (last_night_memory or {}).get("day")
+    if not exec_log or day_ended is None:
+        return
+    discovery_hours = [
+        int(r.get("hour"))
+        for r in (agent_view.get("redsign") or [])
+        if isinstance(r, Mapping) and r.get("day") == day_ended
+        and r.get("hour") is not None
+    ]
+    if not discovery_hours:
+        return
+    discovery_hour = min(discovery_hours)
+
+    by_seat: Dict[str, List[int]] = {}
+    for e in exec_log:
+        if not isinstance(e, Mapping) or e.get("kind") != "enemy":
+            continue
+        if str(e.get("tag") or "") not in _STRIKE_TAGS:
+            continue
+        seat = e.get("seat")
+        hour = e.get("hour")
+        if not seat or hour is None:
+            continue
+        by_seat.setdefault(str(seat), []).append(int(hour) - discovery_hour)
+
+    for seat, offsets in by_seat.items():
+        profile = memory_mod.get_flag(
+            session_id, player, _profile_flag(seat), default=None, store=store,
+        )
+        if not isinstance(profile, dict):
+            profile = {"quadrant_counts": {q: 0 for q in _QUADRANTS},
+                       "sightings": 0, "redsign_finder_sightings": 0,
+                       "strike_hour_offsets": []}
+        existing = list(profile.get("strike_hour_offsets") or [])
+        existing.extend(offsets)
+        profile["strike_hour_offsets"] = existing[-_MAX_STRIKE_SAMPLES:]
+        memory_mod.set_flag(
+            session_id, player, _profile_flag(seat), profile, store=store,
         )
 
 
@@ -142,7 +215,7 @@ def get_profile(
     if not isinstance(profile, dict):
         return {
             "sightings": 0, "preferred_quadrant": None,
-            "redsign_contest_rate": None,
+            "redsign_contest_rate": None, "typical_strike_hour": None,
         }
     counts = profile.get("quadrant_counts") or {}
     sightings = int(profile.get("sightings") or 0)
@@ -152,10 +225,15 @@ def get_profile(
         preferred = max(counts, key=lambda q: counts.get(q, 0))
     finder_sightings = int(profile.get("redsign_finder_sightings") or 0)
     contest_rate = (finder_sightings / sightings) if sightings else None
+    offsets = profile.get("strike_hour_offsets") or []
+    typical_strike_hour = None
+    if len(offsets) >= _MIN_SAMPLES_FOR_STRIKE_HOUR:
+        typical_strike_hour = round(sum(offsets) / len(offsets), 1)
     return {
         "sightings": sightings,
         "preferred_quadrant": preferred,
         "redsign_contest_rate": (
             round(contest_rate, 2) if contest_rate is not None else None
         ),
+        "typical_strike_hour": typical_strike_hour,
     }

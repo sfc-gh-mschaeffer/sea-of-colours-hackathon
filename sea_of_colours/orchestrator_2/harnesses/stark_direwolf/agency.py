@@ -510,6 +510,48 @@ def _snap_option(idx: int, at: Tuple[int, int]) -> Option:
     )
 
 
+def _drop_block_option(idx: int, cell: Tuple[int, int]) -> Option:
+    """Deliberately contest a cell a rival can ALSO reach this hour.
+
+    Phase 2 of IMPROVEMENT_STRATEGIES_PHASE2.md §5. OBS-33 (see
+    ``option_economics.coverage_note``) names DROP BLOCK in prose, but
+    nothing before this offered it as a selectable play — the model had
+    to compose the coordinate itself, exactly the failure mode this whole
+    ID-based menu exists to eliminate everywhere else.
+
+    The engine, not the model, decides which of two outcomes applies at
+    resolution: if the rival ALSO drops this hour, neither lands and the
+    cell's value survives intact for a later wave; if they already
+    landed, dropping in damages them and spills their hold. Either way
+    the pure is never lost to a clean, uncontested rival grab — the cost
+    is a damaged unit (credits to repair), which is why this is a second-
+    harvester insurance play, not a replacement for the primary grab.
+    """
+    return Option(
+        option_id=f"DROPBLOCK{idx}",
+        kind="drop_block",
+        title=f"drop block on {cell}",
+        detail=(
+            f"deliberately drop a SECOND harvester on {cell} — a rival "
+            "has LIVE vision of it and could land here too"
+        ),
+        execute_lines=[f"DROPBLOCK{idx}: drop on ({cell[0]},{cell[1]})"],
+        payload={"drop_at": [int(cell[0]), int(cell[1])], "cells": []},
+        rationale=(
+            f"A rival can SEE {cell} right now, so a clean grab here is "
+            "not guaranteed — but the cell is not lost to them either way. "
+            "If you BOTH drop the same hour, NEITHER lands and the cell "
+            "keeps its value for your next wave. If they are ALREADY "
+            "standing on it, landing in damages them and SPILLS their "
+            "hold — their cargo banks nothing, destroyed rather than "
+            "transferred to you. Costs a damaged unit (credits to repair "
+            "in orbit), so spend it on a pure or the leader, never on a "
+            "vein — this is insurance for a SECOND harvester, not the "
+            "primary grab."
+        ),
+    )
+
+
 def _chain_option(
     idx: int, h: Mapping[str, Any], *, id_suffix: str = "",
     trim_note: str = "",
@@ -866,6 +908,7 @@ def build_registry(
     supersede_hints: Sequence[Mapping[str, Any]] = (),
     snap_cover_hints: Sequence[Mapping[str, Any]] = (),
     snap_targets: Sequence[Tuple[int, int]] = (),
+    drop_block_targets: Sequence[Tuple[int, int]] = (),
     blue_requested: bool = False,
     harvesters_alive: Optional[int] = None,
     hazard_cells: Collection[Any] = (),
@@ -999,6 +1042,13 @@ def build_registry(
         opt = _snap_option(i, cell)
         reg[opt.option_id] = opt
 
+    for i, at in enumerate(drop_block_targets or [], start=1):
+        cell = _xy_tuple(at)
+        if cell is None:
+            continue
+        opt = _drop_block_option(i, cell)
+        reg[opt.option_id] = opt
+
     _apply_hazard(reg, hazard_cells)
     return reg
 
@@ -1081,6 +1131,7 @@ _KIND_HEADERS = [
     ("blue_grab", "HIGH-YIELD BLUE GRABS — ids BL* (rich blue you can SEE and grab with no risk — use when you NEED blue, or you have a spare harvester that would otherwise be wasted on low-yield red; BL* is NOT a GRAB* and does not inherit its priority)"),
     ("supersede", "SUPERSEDES (spend a spare probe to BLIND a rival's probe — deny their next landing & vision; yours survives)"),
     ("snap", "OFFENSIVE SNAP — ids SNAP* (fire a SNAP charge at a rival's redsign finder probe — kills it BEFORE it sees, denying this hour, not just future ones)"),
+    ("drop_block", "DROP BLOCK — ids DROPBLOCK* (deliberately drop a SECOND harvester on a cell a rival can also reach this hour — the cell is never lost to a clean rival grab either way)"),
     ("frontier", "FRONTIER HOT-DROP (last resort — known red is trace-only)"),
 ]
 
@@ -1096,6 +1147,7 @@ _KIND_BLURB = {
     "blue_grab": "rich blue you can SEE — zero risk, no probe; grab it when you need blue or a spare harvester would otherwise idle (RED always outranks it for a scarce harvester).",
     "supersede": "deny an enemy landing by blinding their probe — best when you hold >1 probe or your red chains already bank high (a spare probe is free denial); if you're TRAILING, blind the LEADER's freshest probe first. Skip probes about to expire — their vision is already spent.",
     "snap": "the cheapest weapon in the game (100 blue) — resolves BEFORE the hour-start vision snapshot, so it denies a redsign finder probe's sight this hour, not merely from next hour on like a supersede.",
+    "drop_block": "a SECOND harvester deliberately drops on a cell a rival can also reach — the cell survives a mutual collision intact, and lands damage + a spilled hold if they already got there first. Insurance, not the primary grab; costs a repair.",
     "frontier": "last resort — known red is trace-only; blind-sample the best echo.",
 }
 
