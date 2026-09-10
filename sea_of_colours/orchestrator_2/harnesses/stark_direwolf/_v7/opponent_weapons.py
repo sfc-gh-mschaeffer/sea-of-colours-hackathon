@@ -122,6 +122,13 @@ class WeaponEstimate:
     #: Free-form one-line explanations rendered into the prompt as a
     #: small audit trail. Bounded to the last few entries.
     inferences: List[str] = field(default_factory=list)
+    #: Phase 5 (IMPROVEMENT_STRATEGIES.md §1.5) — set by ``update_estimates``
+    #: when this seat's public total CHANGED since the last turn we saw
+    #: them. A drop means they just fired (their charge is spent — they
+    #: cannot punish THIS turn with it); a rise means they just re-armed.
+    #: Empty when unchanged or this is the first turn we have seen them,
+    #: which is a real "don't know" and deliberately not guessed at.
+    reload_note: str = ""
 
     def has_any(self) -> bool:
         """Is this seat holding ANY ordnance?
@@ -186,14 +193,15 @@ class WeaponEstimate:
         the marginals alone, which read as a joint range and overstated
         what a seat could be carrying (see the class docstring).
         """
+        note = f" [{self.reload_note}]" if self.reload_note else ""
         if int(self.blue) <= 0:
-            return f"{self.seat}: nothing (0 blue of ordnance)"
+            return f"{self.seat}: nothing (0 blue of ordnance){note}"
         held = self.rack_text()
         if self.is_exact():
-            return f"{self.seat}: {self.blue} blue of ordnance — {held}"
+            return f"{self.seat}: {self.blue} blue of ordnance — {held}{note}"
         return (
             f"{self.seat}: {self.blue} blue of ordnance — exactly ONE of "
-            f"these {len(self.racks)}: {held}"
+            f"these {len(self.racks)}: {held}{note}"
         )
 
 
@@ -272,12 +280,14 @@ def update_estimates(
             continue
 
         est = prior.get(seat) or WeaponEstimate(seat=seat)
+        prior_blue = prior[seat].blue if seat in prior else None
         blue = _arsenal_blue(opp)
 
         if blue is None:
             # Weapons are off in this game. Say nothing rather than
             # carrying a stale range forward from a prior turn.
             _set_bounds(est, {}, [], blue=0, cap=0)
+            est.reload_note = ""
         else:
             # Cap the search to the ceiling this game publishes, so a
             # rack the engine could never sell is never proposed.
@@ -290,6 +300,21 @@ def update_estimates(
             est.inferences.append(
                 _audit_line(seat, blue, est, opp, len(loadouts))
             )
+            # Phase 5 — the reload-timing diff. Reuses the SAME prior/
+            # updated pair this function already threads through for the
+            # audit trail; no new storage needed. A missing prior (first
+            # turn we've seen this seat) stays a real unknown, not a 0.
+            if prior_blue is None or blue == prior_blue:
+                est.reload_note = ""
+            elif blue < prior_blue:
+                est.reload_note = (
+                    f"just fired (public blue {prior_blue}->{blue}) — "
+                    "that charge is spent, cannot punish tonight with it"
+                )
+            else:
+                est.reload_note = (
+                    f"just re-armed (public blue {prior_blue}->{blue})"
+                )
 
         if len(est.inferences) > max_audit_lines:
             est.inferences = est.inferences[-max_audit_lines:]

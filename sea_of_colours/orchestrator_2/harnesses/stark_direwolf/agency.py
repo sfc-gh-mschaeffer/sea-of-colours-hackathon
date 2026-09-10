@@ -37,6 +37,7 @@ from sea_of_colours.orchestrator_2.harnesses.stark_direwolf import chain_filter
 from sea_of_colours.orchestrator_2.harnesses.stark_direwolf import comb_shapes
 from sea_of_colours.orchestrator_2.harnesses.stark_direwolf import option_economics
 from sea_of_colours.orchestrator_2.harnesses.stark_direwolf import packager
+from sea_of_colours.orchestrator_2.harnesses.stark_direwolf import rival_profile
 from sea_of_colours.orchestrator_2.harnesses.stark_direwolf import value_pyramid
 from sea_of_colours.orchestrator_2.harnesses.stark_direwolf.seam_control import (
     SeamPattern,
@@ -118,19 +119,98 @@ def _walk(cells: Sequence[Any]) -> str:
 
 
 # ── registry construction ───────────────────────────────────────────────
-def _seam_option(p: SeamPattern) -> Option:
+def _seam_option(p: SeamPattern, agent_view: Optional[Mapping[str, Any]] = None) -> Option:
     # Surface the wave-1 DROP cell in the menu line so the pure-grab reads as a
     # CONCRETE target (not vague prose) — otherwise the thinker gravitates to the
     # raw hot-drop coords and misses the pure (the day-2 whiff).
     detail = p.when
-    if p.waves and not getattr(p.waves[0], "deny_only", False):
+    rationale = p.rationale
+    w0 = p.waves[0] if p.waves else None
+    no_drop = w0 is not None and (
+        getattr(w0, "deny_only", False)
+        or getattr(w0, "emp_only", False)
+        or getattr(w0, "chaff_only", False)
+    )
+    if p.waves and not no_drop:
         d = p.waves[0].drop_at
         detail = f"wave-1 drop ({int(d[0])},{int(d[1])}) — {p.when}"
+    elif p.waves and getattr(w0, "emp_only", False):
+        # Phase 3 — CONTEST_DENY_EMP and any future EMP-only compound: no
+        # drop, no probe — the wave IS the salvo.
+        b = p.beacon
+        targets = getattr(w0, "emp_launch_at", None) or []
+        detail = (
+            f"salvo @({int(b[0])},{int(b[1])}) targets={targets} — {p.when}"
+        )
+        if agent_view is not None:
+            est = option_economics.denial_value_estimate(
+                (int(b[0]), int(b[1])), agent_view,
+            )
+            if est is not None:
+                detail += f" — denies ~{est['expected_pts']}pts"
+    elif p.waves and getattr(w0, "chaff_only", False):
+        # CONTEST_DENY_CHAFF — no drop, no aim: chaff has no location, so the
+        # menu line reads as a broad jam rather than a targeted strike.
+        b = p.beacon
+        detail = f"jam @({int(b[0])},{int(b[1])}) — {p.when}"
+        if agent_view is not None:
+            est = option_economics.denial_value_estimate(
+                (int(b[0]), int(b[1])), agent_view,
+            )
+            if est is not None:
+                detail += f" — denies AT LEAST ~{est['expected_pts']}pts + their whole 3h window"
     elif p.waves:
         # Part B CONTEST_DENY — no drop; surface it as a confirm/deny play so the
         # thinker never reads it as a place to land a harvester.
         b = p.beacon
         detail = f"confirm+deny @({int(b[0])},{int(b[1])}) — {p.when}"
+        # Phase 1 (IMPROVEMENT_STRATEGIES.md §6) — CONTEST_DENY used to render
+        # a bare 0 next to options carrying real numbers, which is why the
+        # model never picked it regardless of doctrine. Price what it denies.
+        if agent_view is not None:
+            est = option_economics.denial_value_estimate(
+                (int(b[0]), int(b[1])), agent_view,
+            )
+            if est is not None:
+                # Phase 6 — a rival profiled as an aggressive redsign
+                # contester makes this denial worth more than the raw
+                # blind_estimate alone says: the counterfactual ("if we
+                # DON'T deny them") is more likely to actually happen. A
+                # small, clearly-labelled multiplier on the DISPLAYED
+                # number, never on the underlying calibrated estimate.
+                shown_pts = est["expected_pts"]
+                profile_note = ""
+                watchers = option_economics._watching_seats(agent_view, (int(b[0]), int(b[1])))
+                if watchers:
+                    meta = agent_view.get("meta") or {}
+                    session_id = str(meta.get("session_id") or "")
+                    player = str(meta.get("player") or (agent_view.get("hud") or {}).get("player") or "")
+                    best_rate = 0.0
+                    for seat in watchers:
+                        prof = rival_profile.get_profile(session_id, player, seat)
+                        rate = prof.get("redsign_contest_rate")
+                        if rate is not None:
+                            best_rate = max(best_rate, rate)
+                    if best_rate >= 0.3:
+                        shown_pts = int(round(shown_pts * (1.0 + best_rate)))
+                        profile_note = (
+                            f" (bumped for a rival profiled contesting "
+                            f"{int(round(best_rate * 100))}% of redsigns "
+                            "they've seen)"
+                        )
+                detail += (
+                    f" — denies ~{shown_pts}pts of likely rival "
+                    f"yield next time they hold vision here "
+                    f"(pure_odds {est['pure_odds']}){profile_note}"
+                )
+                rationale = (
+                    rationale
+                    + f" Denial value: ~{shown_pts} expected points "
+                    "the rival forfeits on this beacon by being superseded + "
+                    "confirmed against instead of left to attack it "
+                    "themselves — not banked tonight, but not zero either."
+                    + profile_note
+                )
     return Option(
         option_id=p.pattern_id,
         kind="seam",
@@ -138,7 +218,7 @@ def _seam_option(p: SeamPattern) -> Option:
         detail=detail,
         execute_lines=p.execute_block().splitlines(),
         payload=p.to_dict(),
-        rationale=p.rationale,
+        rationale=rationale,
     )
 
 
@@ -397,7 +477,43 @@ def _snap_cover_option(
     )
 
 
-def _chain_option(idx: int, h: Mapping[str, Any], *, id_suffix: str = "") -> Option:
+def _snap_option(idx: int, at: Tuple[int, int]) -> Option:
+    """Fire a SNAP at a rival's redsign FINDER probe (IMPROVEMENT_STRATEGIES.md §1.2).
+
+    V12 never bought or fired SNAP offensively — only ever read as a threat
+    to defend against (``_snap_cover_option`` above). SNAP is the one
+    weapon that resolves ABOVE the hour-start vision snapshot (RULEBOOK
+    §4.9.4): killing the finder BEFORE it sees denies tonight, not just
+    future nights — unlike a supersede, which resolves in ordinary dispatch
+    and only denies from next hour on.
+    """
+    return Option(
+        option_id=f"SNAP{idx}",
+        kind="snap",
+        title=f"SNAP the finder probe at {at}",
+        detail=(
+            f"kills the finder at {at} BEFORE tonight's vision snapshot — "
+            "denies whatever it would have shown THIS hour, not just future "
+            "ones"
+        ),
+        execute_lines=[f"SNAP{idx}: snap ({at[0]},{at[1]})"],
+        payload={"at": [int(at[0]), int(at[1])]},
+        rationale=(
+            f"The probe at {at} is lighting a live redsign for its owner — "
+            "the single most valuable SNAP target on the board. Unlike a "
+            "supersede (which lands in ordinary dispatch and only denies "
+            "from next hour), SNAP resolves BEFORE the hour-start snapshot: "
+            "if they were about to hot-drop into that vision this hour, "
+            "the drop is refused outright, not merely delayed. Costs 100 "
+            "blue — the cheapest weapon in the game — and one hour-slot."
+        ),
+    )
+
+
+def _chain_option(
+    idx: int, h: Mapping[str, Any], *, id_suffix: str = "",
+    trim_note: str = "",
+) -> Option:
     oid = f"CH{idx}{id_suffix}"
     drop = _xy(h.get("drop_at"))
     cells = _walk(h.get("cells") or [])
@@ -407,6 +523,8 @@ def _chain_option(idx: int, h: Mapping[str, Any], *, id_suffix: str = "") -> Opt
     detail = "known-red walk, no probe needed"
     if id_suffix == "S":
         detail = "SHORT — grab the rich head and lift early (lower exposure/hold use)"
+    if trim_note:
+        detail += f" — {trim_note}"
     return Option(
         option_id=oid,
         kind="chain",
@@ -422,13 +540,23 @@ def _chain_option(idx: int, h: Mapping[str, Any], *, id_suffix: str = "") -> Opt
 _CHAIN_SHORT_STEPS = 2
 
 
-def _chain_shape_options(idx: int, h: Mapping[str, Any]) -> List[Option]:
+def _chain_shape_options(
+    idx: int, h: Mapping[str, Any], agent_view: Optional[Mapping[str, Any]] = None,
+) -> List[Option]:
     """Full chain plus, for a LONG chain, a SHORT 'rich head' variant.
 
     The greedy chain is purity-descending, so its first cells are the richest;
     a SHORT variant (drop + 2 steps) lets the thinker trade tail length for lower
     exposure / hold use. The two share the same drop cell, so the packager's
     duplicate-drop guard means only one ever executes even if both are selected.
+
+    Phase 7 (IMPROVEMENT_STRATEGIES.md §3.2) — the tradeoff between the two
+    used to be purely instinctual (doctrine says "that judgement is YOURS"
+    and the packager compiles either verbatim, never trims on its own —
+    correct per the OBS-27 lesson on silent cuts). This ANNOTATES the
+    tradeoff with a real number instead of adding a silent cut: how many
+    expected points the tail is worth, and how many of its cells sit under
+    enemy vision right now.
     """
     full = _chain_option(idx, h)
     opts = [full]
@@ -444,7 +572,22 @@ def _chain_shape_options(idx: int, h: Mapping[str, Any]) -> List[Option]:
         sh["purities"] = list(h.get("purities") or [])[:keep]
         sh["tiers"] = list(h.get("tiers") or [])[:keep]
         sh["group"] = f"CH{idx}"
-        opts.append(_chain_option(idx, sh, id_suffix="S"))
+        trim_note = ""
+        if agent_view is not None:
+            tail_cells = [tuple(int(v) for v in c) for c in cells[keep:]]
+            tail_purities = list(h.get("purities") or [])[keep:]
+            tail_cost = sum(
+                option_economics._red_ship_points(int(p)) for p in tail_purities
+            )
+            watched = option_economics._enemy_vision(agent_view)
+            watched_avoided = sum(1 for c in tail_cells if c in watched)
+            if tail_cost > 0 or watched_avoided > 0:
+                trim_note = (
+                    f"vs full: cutting the tail here avoids "
+                    f"{watched_avoided} watched cell{'s' if watched_avoided != 1 else ''} "
+                    f"but costs ~{int(round(tail_cost))} expected points — your call"
+                )
+        opts.append(_chain_option(idx, sh, id_suffix="S", trim_note=trim_note))
     return opts
 
 
@@ -722,6 +865,7 @@ def build_registry(
     chain_hints: Sequence[Mapping[str, Any]] = (),
     supersede_hints: Sequence[Mapping[str, Any]] = (),
     snap_cover_hints: Sequence[Mapping[str, Any]] = (),
+    snap_targets: Sequence[Tuple[int, int]] = (),
     blue_requested: bool = False,
     harvesters_alive: Optional[int] = None,
     hazard_cells: Collection[Any] = (),
@@ -740,7 +884,7 @@ def build_registry(
 
     for p in seam_patterns or []:
         if isinstance(p, SeamPattern):
-            opt = _seam_option(p)
+            opt = _seam_option(p, agent_view)
             reg[opt.option_id] = opt
 
     # A REDSIGN hot-drop hint is ALREADY represented by a seam PATTERN
@@ -769,7 +913,7 @@ def build_registry(
     )
     for i, h in enumerate(kept_chains, start=1):
         if isinstance(h, Mapping):
-            for opt in _chain_shape_options(i, h):
+            for opt in _chain_shape_options(i, h, agent_view):
                 reg[opt.option_id] = opt
 
     for i, h in enumerate(supersede_hints or [], start=1):
@@ -827,7 +971,7 @@ def build_registry(
                 seam_suppressed, key=chain_filter._chain_ev, reverse=True,
             )[:shortfall]
             for i, h in enumerate(restored, start=len(kept_chains) + 1):
-                for opt in _chain_shape_options(i, h):
+                for opt in _chain_shape_options(i, h, agent_view):
                     reg[opt.option_id] = opt
 
     # SNAP COVER last, so it can name every landing option already registered
@@ -843,6 +987,16 @@ def build_registry(
             if covers is not None else []
         )
         opt = _snap_cover_option(i, h, backed)
+        reg[opt.option_id] = opt
+
+    # Offensive SNAP — only offered when the seat actually holds SNAP
+    # stock (the caller filters to that; see harness.py). Deliberately
+    # cheap to reach the menu: one target per known redsign finder probe.
+    for i, at in enumerate(snap_targets or [], start=1):
+        cell = _xy_tuple(at)
+        if cell is None:
+            continue
+        opt = _snap_option(i, cell)
         reg[opt.option_id] = opt
 
     _apply_hazard(reg, hazard_cells)
@@ -926,6 +1080,7 @@ _KIND_HEADERS = [
     ("chain", "JUICE CHAINS (walk known red, no probe)"),
     ("blue_grab", "HIGH-YIELD BLUE GRABS — ids BL* (rich blue you can SEE and grab with no risk — use when you NEED blue, or you have a spare harvester that would otherwise be wasted on low-yield red; BL* is NOT a GRAB* and does not inherit its priority)"),
     ("supersede", "SUPERSEDES (spend a spare probe to BLIND a rival's probe — deny their next landing & vision; yours survives)"),
+    ("snap", "OFFENSIVE SNAP — ids SNAP* (fire a SNAP charge at a rival's redsign finder probe — kills it BEFORE it sees, denying this hour, not just future ones)"),
     ("frontier", "FRONTIER HOT-DROP (last resort — known red is trace-only)"),
 ]
 
@@ -940,6 +1095,7 @@ _KIND_BLURB = {
     "chain": "walk RED you already see — zero probe, guaranteed legal, lowest risk.",
     "blue_grab": "rich blue you can SEE — zero risk, no probe; grab it when you need blue or a spare harvester would otherwise idle (RED always outranks it for a scarce harvester).",
     "supersede": "deny an enemy landing by blinding their probe — best when you hold >1 probe or your red chains already bank high (a spare probe is free denial); if you're TRAILING, blind the LEADER's freshest probe first. Skip probes about to expire — their vision is already spent.",
+    "snap": "the cheapest weapon in the game (100 blue) — resolves BEFORE the hour-start vision snapshot, so it denies a redsign finder probe's sight this hour, not merely from next hour on like a supersede.",
     "frontier": "last resort — known red is trace-only; blind-sample the best echo.",
 }
 

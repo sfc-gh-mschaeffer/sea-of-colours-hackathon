@@ -588,6 +588,31 @@ class _Packer:
         )
         return True
 
+    def spend_chaff(self) -> bool:
+        """Fire one chaff flare (RULEBOOK §4.9.5).
+
+        No target cell — chaff's effect is a global 3-hour window
+        (launch hour + 2 self-jammed carry-over hours), not an area. Like
+        ``spend_emp``, the charge is already paid for in orbit; this only
+        spends the launch hour-slot.
+        """
+        self.moves.append({"a": "chaff_flare"})
+        return True
+
+    def spend_snap(self, at: Any) -> bool:
+        """Fire one SNAP missile at a single cell (RULEBOOK §4.9.4).
+
+        Unlike a probe, SNAP does not consume ``probe_budget`` — it is a
+        weapon charge paid for in orbit, not a probe. Cells need not hold
+        anything: SNAP can strike empty ground, though its whole value is
+        hitting a probe or a landing before that hour's vision snapshot.
+        """
+        cell = _cell(at)
+        if cell is None:
+            return False
+        self.moves.append({"a": "snap", "at": [cell[0], cell[1]]})
+        return True
+
     # ── run transactions ───────────────────────────────────────────
     # A run is "spend the enabling probes, then emit the chain", and the probes
     # have to be emitted FIRST so their disks open before the drop. If the chain
@@ -760,6 +785,17 @@ def _pack_seam(pk: _Packer, payload: Mapping[str, Any]) -> None:
             if w.get("probe_at") is not None:
                 pk.spend_probe(w.get("probe_at"))
             continue
+        # Phase 3 (IMPROVEMENT_STRATEGIES.md §1.4) — a compound wave that is
+        # PURELY a weapon charge (no harvester, mirrors deny_only above).
+        if w.get("emp_only"):
+            if not pk.spend_emp(w.get("emp_launch_at") or []):
+                pk.log.append(
+                    f"cut EMP wave {w.get('wave')}: no target cells"
+                )
+            continue
+        if w.get("chaff_only"):
+            pk.spend_chaff()
+            continue
         unit = pk.next_harvester()
         if unit is None:
             pk.log.append(
@@ -830,6 +866,15 @@ def _pack_emp(pk: _Packer, payload: Mapping[str, Any]) -> None:
         pk.log.append("cut EMP launch: no target cells")
 
 
+def _pack_chaff(pk: _Packer, payload: Mapping[str, Any]) -> None:
+    pk.spend_chaff()
+
+
+def _pack_snap(pk: _Packer, payload: Mapping[str, Any]) -> None:
+    if not pk.spend_snap(payload.get("at")):
+        pk.log.append("cut SNAP: no target cell")
+
+
 def _pack_frontier(pk: _Packer, payload: Mapping[str, Any]) -> None:
     at = _cell(payload.get("at"))
     if at is None:
@@ -881,6 +926,8 @@ _DISPATCH = {
     "supersede": _pack_supersede,
     "frontier": _pack_frontier,
     "emp": _pack_emp,
+    "chaff": _pack_chaff,
+    "snap": _pack_snap,
 }
 
 
@@ -1028,4 +1075,49 @@ def pack_recipe(
             probe_hints=probe_hints,
             supersede_hints=supersede_hints,
         )
+    pk.moves, hoist_log = _hoist_emp_salvos(pk.moves)
+    pk.log.extend(hoist_log)
     return pk.moves, pk.log
+
+
+#: A salvo fired later than this hour is close to wasted — see
+#: :func:`_hoist_emp_salvos`. Mirrors emp_harvest_test's LATEST_USEFUL_HOUR.
+_LATEST_USEFUL_EMP_HOUR = 2
+
+
+def _hoist_emp_salvos(
+    moves: Sequence[Mapping[str, Any]], *, latest: int = _LATEST_USEFUL_EMP_HOUR,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Move any ``emp_launch`` queued past hour ``latest`` to the front.
+
+    Phase 3 (IMPROVEMENT_STRATEGIES.md §1.4). Options are compiled in the
+    order the agent selected them (``pack_recipe``'s own doc), which is
+    right for everything except a weapon salvo: an EMP's value is almost
+    entirely the hours right after it forms — probes die on contact and
+    rival vision is spent early, landings happen early, and a cloud fired
+    at hour 15 in a 21-hour Nox mostly runs out of night before it runs
+    out of hours. Whitewalker's own forced strike already gets hour 1 by
+    construction (it is spliced in directly by harness.py); this pass
+    gives any OTHER emp_launch — from a compound play the model selected
+    itself — the same treatment, regardless of where in the agent's
+    chosen option order it happened to land.
+
+    Hoisting is safe for everything else: pulling a move forward shifts
+    the rest back by one and preserves their relative order.
+    """
+    rows = [dict(m) for m in moves if isinstance(m, Mapping)]
+    late = [
+        i for i, m in enumerate(rows)
+        if str(m.get("a")) == "emp_launch" and i >= latest
+    ]
+    if not late:
+        return rows, []
+    salvos = [rows[i] for i in late]
+    rest = [m for i, m in enumerate(rows) if i not in set(late)]
+    log = [
+        f"{len(salvos)} EMP salvo(s) moved to the front of the night "
+        f"(were queued at hour {', '.join(str(i + 1) for i in late)}) — a "
+        f"salvo after hour {latest} is close to wasted: the cloud's value "
+        "is concentrated in the hours right after it forms."
+    ]
+    return salvos + rest, log

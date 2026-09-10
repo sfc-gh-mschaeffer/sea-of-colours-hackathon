@@ -74,6 +74,16 @@ class OrbitDials:
     emp_stockpile_cap: int = 2
     #: Stop buying chaff at this many in stock, in the always-build band.
     chaff_stockpile_cap: int = 1
+    #: BLUE above which a SNAP is bought opportunistically. Deliberately
+    #: lower than :attr:`blue_emp_roll` / :attr:`blue_always_build` — SNAP
+    #: is the cheapest weapon on the ladder (100 blue) and its value
+    #: (denying a rival's finder probe or a same-hour landing, RULEBOOK
+    #: §4.9.4) doesn't need a blue surplus to be worth having; a small
+    #: buffer above its own cost is enough. See IMPROVEMENT_STRATEGIES.md
+    #: §1.2 — V12 never bought SNAP at all.
+    blue_snap_buy: int = 150
+    #: Stop buying SNAP at this many in stock.
+    snap_stockpile_cap: int = 2
 
     # Fallback prices — mirrors of the engine constants.
     repair_cost: int = 500
@@ -88,6 +98,8 @@ class OrbitDials:
     emp_credit_cost: int = 250
     chaff_blue_cost: int = 300  # v1.36 — was 255
     chaff_credit_cost: int = 0
+    snap_blue_cost: int = 100
+    snap_credit_cost: int = 250
     #: Fallback for ``meta.rules.weapon_blue_cap`` (RULEBOOK §4.9.8) —
     #: the most blue-worth of ordnance a seat may hold. Unlike the dials
     #: above this is not doctrine and retuning it buys you nothing: the
@@ -214,6 +226,7 @@ def plan_orbit_actions(
     weapon_stock = orbit.get("weapon_stock") or {}
     emp_stock = int(weapon_stock.get("emp", 0) or 0)
     chaff_stock = int(weapon_stock.get("chaff", 0) or 0)
+    snap_stock = int(weapon_stock.get("snap", 0) or 0)
     weapon_prices = orbit.get("weapon_prices") or {}
     emp_price = weapon_prices.get("emp") or {}
     emp_blue_cost = int(emp_price.get("blue", dials.emp_blue_cost))
@@ -223,6 +236,9 @@ def plan_orbit_actions(
     chaff_credit_cost = int(
         chaff_price.get("credits", dials.chaff_credit_cost),
     )
+    snap_price = weapon_prices.get("snap") or {}
+    snap_blue_cost = int(snap_price.get("blue", dials.snap_blue_cost))
+    snap_credit_cost = int(snap_price.get("credits", dials.snap_credit_cost))
     # v1.34 — the arsenal ceiling (RULEBOOK §4.9.8), needed by priority 0
     # as well as priority 3, so it is computed once up top.
     weapon_blue_cap = int(
@@ -325,6 +341,31 @@ def plan_orbit_actions(
             blue_total >= chaff_blue_cost
             and remaining >= chaff_credit_cost
             and _room_for(chaff_blue_cost)
+        )
+
+    def _afford_snap() -> bool:
+        return (
+            blue_total >= snap_blue_cost
+            and remaining >= snap_credit_cost
+            and _room_for(snap_blue_cost)
+        )
+
+    # Priority 3pre: SNAP, opportunistically, well below the chaff/EMP
+    # surplus thresholds — it is cheap enough (100 blue) that waiting for
+    # a 250-300 blue surplus just to afford chaff/EMP means never buying
+    # the one weapon that can deny a same-hour landing (RULEBOOK §4.9.4).
+    if (
+        weapons_enabled
+        and blue_total > dials.blue_snap_buy
+        and snap_stock < dials.snap_stockpile_cap
+        and _afford_snap()
+    ):
+        actions.append({"a": "build_snap", "count": 1})
+        remaining -= snap_credit_cost
+        held_weapon_blue += snap_blue_cost
+        descriptors.append(
+            f"built SNAP (blue {blue_total} > {dials.blue_snap_buy}) — "
+            "cheapest denial in the game, buy it early"
         )
 
     if weapons_enabled and not _room_for(min(emp_blue_cost, chaff_blue_cost)):

@@ -68,6 +68,7 @@ from sea_of_colours.orchestrator_2.harnesses.stark_direwolf.comb_shapes import (
 from sea_of_colours.orchestrator_2.harnesses.stark_direwolf.hazard_memory import (
     view_green_cells as _view_green_cells,
 )
+from sea_of_colours.orchestrator_2.harnesses.stark_direwolf import option_economics
 from sea_of_colours.orchestrator_2.harnesses.stark_direwolf._v7.probe_hints import (
     _covers,
     _enemy_probe_cells,
@@ -343,6 +344,24 @@ class SeamWave:
     # step onto FOG cells — it only refuses KNOWN stripped/green (hazard memory).
     # This is the accepted-risk attack on a fresh, mass-rich rival redsign.
     blind_walk: bool = False
+    # Phase 3 (IMPROVEMENT_STRATEGIES.md §1.4) — compound-play wave fields,
+    # mirroring emp_harvest_test's SMASH_THEN_LOCK/RACE_CRASH_EMP vocabulary.
+    # An ``emp_only``/``chaff_only`` wave commits NO harvester (like
+    # ``deny_only`` above) — it spends a weapon charge and nothing else.
+    # These must never be used for whitewalker's own one-time strike, which
+    # stays a harness-forced injection outside this pattern machinery; see
+    # harness.py's ``whitewalker_mod.already_fired`` gate before any caller
+    # offers a compound that would spend an EMP the seat doesn't actually
+    # have spare.
+    emp_launch_at: List[Tuple[int, int]] = field(default_factory=list)
+    emp_hole: Optional[Tuple[int, int]] = None
+    emp_only: bool = False
+    chaff_only: bool = False
+    #: Documents that a LATER wave's ``earliest_hour`` was deliberately
+    #: pushed past this wave's EMP cloud lifetime — the hour math itself is
+    #: computed by whoever builds the pattern (the cloud duration is a
+    #: known constant), this only records that it was intentional.
+    defer_until_clear: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -354,6 +373,14 @@ class SeamWave:
             "deny_only": bool(self.deny_only),
             "contested": bool(self.contested),
             "blind_walk": bool(self.blind_walk),
+            "emp_launch_at": [[int(x), int(y)] for x, y in self.emp_launch_at],
+            "emp_hole": (
+                [int(self.emp_hole[0]), int(self.emp_hole[1])]
+                if self.emp_hole is not None else None
+            ),
+            "emp_only": bool(self.emp_only),
+            "chaff_only": bool(self.chaff_only),
+            "defer_until_clear": bool(self.defer_until_clear),
             "probe_at": (
                 [int(self.probe_at[0]), int(self.probe_at[1])]
                 if self.probe_at is not None else None
@@ -2209,6 +2236,146 @@ def _rival_deny_pattern(
     return [deny]
 
 
+#: EMP charges reserved before this compound may spend one. Conservative:
+#: whitewalker's own flag lives outside seam_control's pure-function call
+#: graph (it needs session_id/player/store), so this always assumes ONE
+#: charge is spoken for even after whitewalker has actually fired — a
+#: seat that could technically offer one more compound a night early is a
+#: far safer failure than ever double-spending the reserved charge.
+_EMP_RESERVED_FOR_WHITEWALKER = 1
+
+
+def _rival_deny_emp_pattern(
+    agent_view: Mapping[str, Any],
+    beacon: Tuple[int, int],
+) -> List[SeamPattern]:
+    """CONTEST_DENY_EMP — hard denial: salvo the smear instead of supersede+confirm.
+
+    Phase 3 (IMPROVEMENT_STRATEGIES.md §1.4), generalizing the compound-play
+    pattern beyond whitewalker's one scripted strike. Where CONTEST_DENY
+    spends a probe to blind the finder and confirm for tomorrow,
+    CONTEST_DENY_EMP spends a SECOND (or later) EMP charge to salvo the
+    smear directly — no probe needed, and unlike CONTEST_DENY it also
+    denies any OTHER rival probe already covering the beacon, not just the
+    one finder. Priced with the same :func:`option_economics.denial_value_estimate`
+    CONTEST_DENY now carries (Phase 1), so it shows a real number too.
+
+    Offered only when EMP stock exceeds what whitewalker's own one-time
+    strike may still need — never spends the reserved charge.
+    """
+    emp_stock = int(
+        ((agent_view.get("orbit") or {}).get("weapon_stock") or {}).get("emp", 0) or 0
+    )
+    available = emp_stock - _EMP_RESERVED_FOR_WHITEWALKER
+    if available < 1:
+        return []
+    targets = option_economics.smear_target_cells(beacon, agent_view, max_cells=3)
+    if not targets:
+        return []
+    estimate = option_economics.denial_value_estimate(beacon, agent_view)
+    value_line = (
+        f" — denies ~{estimate['expected_pts']}pts of likely rival yield "
+        f"here (pure_odds {estimate['pure_odds']})"
+        if estimate is not None else ""
+    )
+    note = (
+        "HARD DENIAL — salvo the smear directly rather than superseding one "
+        "probe. Costs an EMP charge (200 blue, spent in orbit already) and "
+        "one hour-slot, but denies the WHOLE smear for 8 hours: any probe "
+        "the rival has covering it dies too, and no drop can land there "
+        "while the cloud stands. No harvester committed."
+    )
+    pattern = SeamPattern(
+        pattern_id="CONTEST_DENY_EMP",
+        kind="CONTEST_DENY_EMP",
+        beacon=beacon,
+        mine=False,
+        title="Salvo the rival seam (hard denial, no probe)",
+        when="you hold a spare EMP and want the smear denied outright",
+        rationale=(
+            "A probe-based CONTEST_DENY only removes the finder; any other "
+            "rival probe already watching this beacon keeps its vision. An "
+            "EMP salvo denies the whole smear for 8 hours regardless of how "
+            "many probes are on it — the harder, more expensive version of "
+            "the same idea." + value_line
+        ),
+        waves=[SeamWave(
+            1, _H_SMASH, beacon, [], emp_launch_at=list(targets),
+            emp_only=True, unit_ordinal=-1,
+            note=note,
+        )],
+    )
+    return [pattern]
+
+
+def _rival_deny_chaff_pattern(
+    agent_view: Mapping[str, Any],
+    beacon: Tuple[int, int],
+) -> List[SeamPattern]:
+    """CONTEST_DENY_CHAFF — jam the rival's WHOLE night, not just this seam.
+
+    Phase 3 follow-up (IMPROVEMENT_STRATEGIES.md §1.4 / validation finding,
+    2026-09-10): chaff purchases were real (built regularly by
+    ``orbit_policy.py``) but had NO producer anywhere that ever fired one —
+    the compound-play generalization only shipped the EMP variant. Chaff's
+    shape is different from EMP's (RULEBOOK §4.9.5): it has NO location and
+    NO duration in the sense EMP's cloud does — it cancels every OTHER
+    seat's actions for the next 3 consecutive hours, full stop. Aimed at a
+    fogged rival redsign the same way CONTEST_DENY_EMP is, its value is
+    actually BROADER than a salvo: it does not just deny this one beacon,
+    it cancels the rival's ENTIRE queued night for that window — their
+    probe launches, drops, steps, pickups, and any weapon they try to fire
+    back all fail, not just their reach into this smear. And unlike EMP
+    (200 blue) it is the cheaper of the two once bought (300 blue but 0
+    credits per ``orbit_policy.py``'s dials).
+
+    No reservation needed here (unlike EMP): chaff was never part of
+    whitewalker's one-time strike, so any chaff in stock is free to spend.
+    """
+    chaff_stock = int(
+        ((agent_view.get("orbit") or {}).get("weapon_stock") or {}).get("chaff", 0) or 0
+    )
+    if chaff_stock < 1:
+        return []
+    estimate = option_economics.denial_value_estimate(beacon, agent_view)
+    value_line = (
+        f" — denies AT LEAST ~{estimate['expected_pts']}pts on this seam alone "
+        f"(pure_odds {estimate['pure_odds']}), plus everything else their "
+        "queued night depended on for the next 3 hours"
+        if estimate is not None else
+        " — denies whatever the rival's queued night depended on for the next 3 hours"
+    )
+    note = (
+        "BROAD DENIAL, no aim required — chaff has no location: it cancels "
+        "every action the rival queues for the next 3 hours, everywhere on "
+        "the board, not just on this beacon. Costs a chaff charge (300 "
+        "blue, spent in orbit already, 0 credits) and one hour-slot. No "
+        "harvester, no probe committed — your own fleet works uninterrupted "
+        "elsewhere this night."
+    )
+    pattern = SeamPattern(
+        pattern_id="CONTEST_DENY_CHAFF",
+        kind="CONTEST_DENY_CHAFF",
+        beacon=beacon,
+        mine=False,
+        title="Jam the rival's whole night (chaff, no probe)",
+        when="you hold chaff and want the rival's night cancelled, not just this seam",
+        rationale=(
+            "A probe-based CONTEST_DENY only removes the finder, and an EMP "
+            "salvo only denies this one smear. Chaff denies neither an area "
+            "nor a probe — it denies every OTHER seat's action for 3 "
+            "straight hours, full stop, so whatever the rival queued for "
+            "this window (a redsign race, a weapon launch, a routine "
+            "harvest) fails regardless of where it targets." + value_line
+        ),
+        waves=[SeamWave(
+            1, _H_SMASH, beacon, [], chaff_only=True, unit_ordinal=-1,
+            note=note,
+        )],
+    )
+    return [pattern]
+
+
 def _rival_blind_attack_patterns(
     agent_view: Mapping[str, Any],
     hint: Mapping[str, Any],
@@ -2472,7 +2639,12 @@ def _rival_patterns(
             agent_view, hint, beacon, threat,
             width=width, height=height, seat_index=seat_index,
         )
-        return attack + deny
+        # Phase 3 — the harder, EMP-funded denial alternative. Additive:
+        # only appears when a spare charge exists (see its own reservation
+        # check), so it never competes with CONTEST_DENY for a probe.
+        deny_emp = _rival_deny_emp_pattern(agent_view, beacon)
+        deny_chaff = _rival_deny_chaff_pattern(agent_view, beacon)
+        return attack + deny + deny_emp + deny_chaff
 
     # BLIND_GRAB: overwrite the finder's probe, then a short blind drop. We stage
     # behind our OWN fresh probe (force_probe) — but if we happen to already see

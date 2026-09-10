@@ -39,6 +39,9 @@ from sea_of_colours.orchestrator_2.harnesses.stark_direwolf._v7.probe_hints impo
     _redsign_cells,
     _vision_disk,
 )
+from sea_of_colours.orchestrator_2.harnesses.stark_direwolf.supersede import (
+    _enemy_probes,
+)
 
 Cell = Tuple[int, int]
 
@@ -688,6 +691,77 @@ def blind_estimate(
     }
 
 
+#: A comb-sized cap on how many smear cells feed the denial estimate below —
+#: matches HOLD_CAPACITY (drop + 5 steps), so the number represents what a
+#: REALISTIC attack on that beacon could carry home, not the whole smear's
+#: total intensity (which no single outing could ever bank in one trip).
+_DENIAL_COMB_CELLS = 6
+
+
+def smear_target_cells(
+    beacon: Cell, agent_view: Mapping[str, Any], *, max_cells: int = _DENIAL_COMB_CELLS,
+) -> List[Cell]:
+    """The top ``max_cells`` highest-intensity cells of the smear nearest ``beacon``.
+
+    Shared geometry helper behind :func:`denial_value_estimate` (pricing)
+    and any weapon that needs to AIM at a beacon's smear (Phase 3 EMP/chaff
+    compounds) — one region-matching implementation, not two. Returns ``[]``
+    when no live redsign region matches.
+    """
+    regions = _redsign_smear_regions(agent_view)
+    if not regions:
+        return []
+    bx, by = beacon
+    best_region: Optional[Dict[Cell, float]] = None
+    best_dist: Optional[int] = None
+    for region in regions:
+        if not region:
+            continue
+        peak = max(region, key=lambda c: region[c])
+        dist = max(abs(peak[0] - bx), abs(peak[1] - by))  # Chebyshev
+        if best_dist is None or dist < best_dist:
+            best_region, best_dist = region, dist
+    if best_region is None:
+        return []
+    return sorted(best_region, key=lambda c: best_region[c], reverse=True)[:max_cells]
+
+
+def denial_value_estimate(
+    beacon: Cell, agent_view: Mapping[str, Any], *, max_cells: int = _DENIAL_COMB_CELLS,
+) -> Optional[Dict[str, Any]]:
+    """What a CONTEST_DENY (or any deny-only play) is actually worth, priced.
+
+    Phase 1 of the time-axis pricing work (IMPROVEMENT_STRATEGIES.md §6).
+    CONTEST_DENY's whole value is next-night — supersede the finder, confirm
+    the beacon, and deny the rival's own attack on it — and until now that
+    rendered as a bare 0 on the menu next to options carrying real numbers,
+    for exactly the reason a bare EMP salvo did (docs/TEACHING_WEAPONS.md).
+
+    The fix reuses :func:`blind_estimate`'s own calibrated model rather than
+    inventing a second one: the smear's expected value IF SOMEONE combs it is
+    the same number whether that someone is us attacking or a rival we are
+    denying — a redsign's promise (a pure worth ``pure_pts`` sits somewhere
+    in the smear, per-cell odds equal to intensity share) does not care who
+    is asking. So "value denied" = the same ``expected_pts`` a symmetric
+    attack option on this beacon would carry, capped to a realistic
+    hold-capacity-sized comb rather than the whole smear.
+
+    Returns ``None`` when the beacon doesn't match any live redsign region
+    (matches :func:`blind_estimate`'s "don't invent a number" contract) —
+    happens if the beacon's redsign has already retired between menu builds.
+    """
+    bx, by = beacon
+    top_cells = smear_target_cells(beacon, agent_view, max_cells=max_cells)
+    if not top_cells:
+        return None
+    estimate = blind_estimate(top_cells, agent_view)
+    if estimate is None:
+        return None
+    estimate = dict(estimate)
+    estimate["denied_beacon"] = (int(bx), int(by))
+    return estimate
+
+
 def overlap_claims(
     walks: Mapping[str, Sequence[Cell]], agent_view: Mapping[str, Any],
 ) -> Dict[str, List[Tuple[Cell, str, List[str]]]]:
@@ -901,6 +975,57 @@ def _enemy_armed(weapon_estimates: Optional[Mapping[str, Any]]) -> bool:
                 return True
             continue
         if getattr(e, "emps_max", 0) > 0 or getattr(e, "chaff_max", 0) > 0:
+            return True
+    return False
+
+
+def _watching_seats(agent_view: Mapping[str, Any], cell: Cell) -> Set[str]:
+    """Which seat(s) have EVER had a probe watching ``cell`` — owner-attributed.
+
+    Phase 5 (IMPROVEMENT_STRATEGIES.md §1.5). ``_enemy_probe_cells`` (used by
+    :func:`rival_knowledge` above) deliberately mixes every rival's sightings
+    with no owner, because "is this cell watched at all" doesn't need one.
+    This does — the question here is WHICH seat, so a decoded rack can be
+    checked against the seat that actually matters instead of "is anyone
+    anywhere armed". Reuses :func:`supersede._enemy_probes`, the same public
+    sighting channel, rather than a second intel path.
+    """
+    width, height = _grid_dims(agent_view)
+    seats: Set[str] = set()
+    for row in _enemy_probes(agent_view):
+        at = row.get("at")
+        if not (isinstance(at, (list, tuple)) and len(at) == 2):
+            continue
+        owner = row.get("owner")
+        if not owner:
+            continue
+        if cell in _vision_disk(int(at[0]), int(at[1]), width, height):
+            seats.add(str(owner))
+    return seats
+
+
+def _armed_watcher(
+    weapon_estimates: Optional[Mapping[str, Any]], watching_seats: Set[str],
+) -> bool:
+    """Is one of the seats actually watching this cell the one holding a weapon?
+
+    Replaces a blanket ``_enemy_armed`` check for risk annotations that are
+    about ONE cell: a seat with a decoded rack that isn't even watching
+    this cell can't punish a play here, however armed they are elsewhere on
+    the board. Falls back to "unknown watcher" (not armed) rather than
+    guessing when a watching probe's owner wasn't attributed.
+    """
+    if not watching_seats:
+        return False
+    for seat, est in (weapon_estimates or {}).items():
+        if str(seat) not in watching_seats:
+            continue
+        probe = getattr(est, "has_any", None)
+        if callable(probe):
+            if probe():
+                return True
+            continue
+        if getattr(est, "emps_max", 0) > 0 or getattr(est, "chaff_max", 0) > 0:
             return True
     return False
 
@@ -1222,6 +1347,12 @@ def collision_risk(
         cell = public_hit[0]
         cell_s = f"({cell[0]},{cell[1]})"
         know = rival_knowledge(agent_view, cell, day)
+        # Phase 5 (IMPROVEMENT_STRATEGIES.md §1.5) — WHICH seat(s) are
+        # actually watching this cell, so the VERY HIGH escalation below
+        # can check whether THAT seat holds a weapon rather than "is
+        # anyone anywhere armed" (a lone SNAP on the far side of the map
+        # used to read identically to an EMP sitting on this exact cell).
+        watching_seats = _watching_seats(agent_view, cell)
         if know["tier"] == "live":
             n = know["watchers"]
             vision_s = (
@@ -1301,7 +1432,7 @@ def collision_risk(
                 "punish a longer walk. The level is telling you to GO, not to "
                 "cut the chain — take the full sweep"
             )
-        if know["tier"] == "live" and armed and rivals > 1:
+        if know["tier"] == "live" and _armed_watcher(weapon_estimates, watching_seats) and rivals > 1:
             level = "VERY HIGH"
             reason += (
                 "; VERY HIGH — a rival can SEE this cell, holds a weapon, and is "

@@ -81,6 +81,7 @@ from sea_of_colours.orchestrator_2.harnesses.stark_direwolf import (
     option_economics as econ_mod,
     orbit as orbit_mod,
     packager,
+    rival_profile as rival_profile_mod,
     seam_control as seam_control_mod,
     speculative as speculative_mod,
     supersede as supersede_mod,
@@ -402,6 +403,13 @@ def run(
         session_id, player, agent_view,
         day=day, store=store, season_name=season_name,
     )
+    # Phase 6 (IMPROVEMENT_STRATEGIES.md §5) — the first POSITIVE memory in
+    # this harness: quadrant preference + redsign-contest rate per rival
+    # seat, built from the same public probe sightings supersede.py already
+    # reads. Feeds Phase 1's denial pricing below.
+    rival_profile_mod.record_turn(
+        session_id, player, agent_view, store=store,
+    )
     _anchored_labels = {"redsign", "blue_sign", "echo", "seam_extension"}
     anchored_probes = [
         h for h in probe_hints_mod.top_probe_hints(
@@ -536,6 +544,13 @@ def run(
         hot_drop_hints=hot_drop_hints,
         estimates=weapon_estimates,
     )
+    # Phase 2 (IMPROVEMENT_STRATEGIES.md §1.2) — offensive SNAP. Only worth
+    # offering when the seat actually holds a charge; the finder-probe
+    # targeting reuses supersede's own computation rather than a second
+    # intel path (probe launches are public, RULEBOOK §3.15).
+    snap_targets: List[Any] = []
+    if int(((agent_view.get("orbit") or {}).get("weapon_stock") or {}).get("snap", 0) or 0) >= 1:
+        snap_targets = sorted(supersede_mod._redsign_finder_cells(agent_view))
     option_registry = agency_mod.build_registry(
         agent_view=agent_view,
         seam_patterns=seam_patterns,
@@ -544,6 +559,7 @@ def run(
         chain_hints=chain_hints,
         supersede_hints=supersede_hints,
         snap_cover_hints=snap_cover_hints,
+        snap_targets=snap_targets,
         blue_requested=want_blue,
         harvesters_alive=harvesters_alive,
         hazard_cells=hazard_cells,

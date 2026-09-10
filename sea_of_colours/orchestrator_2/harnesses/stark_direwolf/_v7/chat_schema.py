@@ -42,7 +42,10 @@ _MOVE_ITEM = {
     "properties": {
         "a": {
             "type": "string",
-            "enum": ["drop", "step", "pickup", "probe", "emp_launch"],
+            "enum": [
+                "drop", "step", "pickup", "probe", "emp_launch",
+                "chaff_flare", "snap",
+            ],
         },
         "unit": {"type": "string"},
         # Loose on purpose (module docstring: schema only guarantees rough

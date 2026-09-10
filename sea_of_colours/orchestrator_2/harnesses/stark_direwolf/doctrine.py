@@ -507,7 +507,12 @@ REDSIGN POKER (no weapons in play) — a public pure-RED beacon is a HONEYPOT:
       SMASH it for real tomorrow. Prefer this over a blind attack only when you
       are AHEAD (protect the lead, take the sure denial) or you specifically want
       certainty before spending a harvester. It is denial without the fog gamble
-      — but it banks nothing tonight, so it is the cautious pick, not the default.
+      — and it now carries its own number on the menu line ("denies ~Npts of
+      likely rival yield"), the same expected-value model priced against a
+      blind attack on that same beacon. It still banks NOTHING tonight, so
+      weigh that printed number against tonight's certain grabs directly —
+      "denies ~600" beats a "+150" trace chain; it does not beat a "+700" pure
+      you can see and take right now.
 
   2b. LIVE-confirmed (a live probe of yours already reveals red on the seam) —
       the menu shows the aggressive trio. Now you KNOW where the value is, so

@@ -43,6 +43,31 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, 
 # Probe disk radius (Chebyshev). Must match the engine's probe FOV rule.
 _PROBE_RADIUS = 4
 
+# Phase 4 (IMPROVEMENT_STRATEGIES.md §2.1) — the v1.29 halo-grading radii
+# every jackpot is built with (RULEBOOK §2.2 / generator.py GenerationParams
+# defaults). Not exposed on the live view (unlike probe radius via
+# meta.rules), so hardcoded here the same way emp_harvest_test/scorch.py
+# hardcodes engine constants a stripped test view wouldn't carry — these
+# are generation-time constants, not a per-game dial.
+_PURE_MASS_RADIUS = 1.5   # Euclidean — mass CORE around a jackpot
+_PURE_VEIN_RADIUS = 4.2   # Euclidean — vein SHOULDER around a jackpot
+# How much a nearby mass/vein cell raises a candidate's gradient score.
+# Mass weighted far higher than vein: seeing mass means a pure is likely
+# within 1.5 cells (the core radius); seeing vein only bounds it to 4.2.
+_GRADIENT_MASS_WEIGHT = 40.0
+_GRADIENT_VEIN_WEIGHT = 8.0
+_GRADIENT_WEIGHT = 1.0  # how much gradient_promise contributes to internal_rank
+
+# Phase 7 (IMPROVEMENT_STRATEGIES.md §3, probe expiry scheduling). A probe
+# this close to lapsing should stop blocking its own replacement and start
+# attracting one.
+_PROBE_EXPIRY_SOON = 1
+#: Priority bump for a candidate that would replace an expiring probe —
+#: smaller than the redsign/blue_sign bonuses (losing vision entirely is
+#: real but not as urgent as a live signal), big enough to win ties against
+#: an ordinary exploration seed of similar area_gain.
+_EXPIRY_REPLACEMENT_BONUS = 50.0
+
 # v9 seeded-variability knobs (Phase 1). These are ONLY consulted when a caller
 # passes an ``rng`` (the v9 harness does; frozen v6/v7/v8 pass nothing, so their
 # output is byte-identical to before). ``_TIE_EPS`` is the "near-tie" band:
@@ -622,6 +647,43 @@ def _score_candidate(
     return area_gain, int(round(edge)), disk_cells
 
 
+def _gradient_promise(
+    at: Tuple[int, int], red: Mapping[Tuple[int, int], int],
+) -> int:
+    """How strongly nearby VISIBLE mass/vein cells imply a pure sits here.
+
+    Phase 4 (IMPROVEMENT_STRATEGIES.md §2.1). ``edge_promise`` already sums
+    purity around a candidate, but flatly — it can tell you "there's red
+    near here," not WHICH DIRECTION the deposit centre is. The v1.29 halo
+    grading (RULEBOOK §2.2) is a specific, exploitable shape: every pure
+    has ``mass`` chunks within a 1.5-cell Euclidean core and a ``vein``
+    shoulder out to 4.2 cells — so a visible mass cell is much stronger
+    evidence of a nearby pure than a visible vein cell, and this weights
+    them accordingly instead of treating all red as one undifferentiated
+    signal.
+
+    Deliberately centre-only (checks distance from ``at``, not from every
+    disk cell) — the candidate's OWN placement is what should be biased
+    toward the implied centre, not the disk's edge.
+    """
+    score = 0.0
+    for (rx, ry), purity in red.items():
+        tier = _tier_name(purity)
+        if tier == "mass":
+            radius, weight = _PURE_MASS_RADIUS, _GRADIENT_MASS_WEIGHT
+        elif tier == "vein":
+            radius, weight = _PURE_VEIN_RADIUS, _GRADIENT_VEIN_WEIGHT
+        else:
+            continue
+        dist = ((rx - at[0]) ** 2 + (ry - at[1]) ** 2) ** 0.5
+        if dist <= radius:
+            # Closer within the band scores higher, linearly to 0 at the
+            # band's own edge — a cell right at the mass core's boundary
+            # is weaker evidence than one sitting on top of it.
+            score += weight * (1.0 - dist / max(radius, 1e-6))
+    return int(round(score))
+
+
 def top_probe_hints(
     agent_view: Mapping[str, Any],
     *,
@@ -692,7 +754,8 @@ def top_probe_hints(
     #   4 = perfect overlap, 8 = no overlap.
     # Threshold=4 kills exact-duplicate coords; threshold=6 kills
     # significant overlap. We use 5 as a middle ground.
-    active_probes = _friendly_probe_positions(agent_view)
+    active_probes = _friendly_probe_positions(agent_view, exclude_expiring=True)
+    expiring_probes = _expiring_friendly_probe_positions(agent_view)
     prior_probes = list(historical_probe_positions or [])
     all_probes = list({*active_probes, *prior_probes})
     _MIN_PROBE_SEPARATION = 5
@@ -709,18 +772,23 @@ def top_probe_hints(
         if not seeds:
             return []
 
-    scored: List[Tuple[float, int, int, Tuple[int, int], str]] = []
+    scored: List[Tuple[float, int, int, int, Tuple[int, int], str]] = []
     for at, label in seeds.items():
         area_gain, edge_promise, _ = _score_candidate(at, width, height, los, red, echoes)
+        gradient_promise = _gradient_promise(at, red)
         # Probes MUST reveal new fog to earn a slot. Removed the previous
         # "signal cells always earn a slot" carve-out — signals are for
         # WALKING (via chain hints / hot drop hints), not for re-probing
         # cells already in LOS. If a bluesign cell is in a friendly
         # probe's disk, we already see it; a new probe there wastes an
         # hour and a probe slot.
-        if area_gain <= 0 and edge_promise <= 0:
+        if area_gain <= 0 and edge_promise <= 0 and gradient_promise <= 0:
             continue
-        internal_rank = area_gain + _EDGE_WEIGHT * edge_promise
+        internal_rank = (
+            area_gain
+            + _EDGE_WEIGHT * edge_promise
+            + _GRADIENT_WEIGHT * gradient_promise
+        )
         # Modest bonuses for signal-associated seeds still apply — they
         # bias the compiler toward probes that BOTH reveal new fog AND
         # extend toward a signal cluster. But signals alone (area_gain=0)
@@ -729,7 +797,17 @@ def top_probe_hints(
             internal_rank += 500
         elif label == "blue_sign":
             internal_rank += 100
-        scored.append((internal_rank, area_gain, edge_promise, at, label))
+        # Phase 7 — a candidate that would REPLACE a lapsing probe's vision
+        # (sits within the same separation band an expiring probe used to
+        # occupy) is prioritized over an equally-scored ordinary
+        # exploration seed, rather than left to compete on area_gain alone
+        # against a probe that isn't even about to keep seeing anything.
+        if any(
+            max(abs(at[0] - px), abs(at[1] - py)) < _MIN_PROBE_SEPARATION
+            for (px, py) in expiring_probes
+        ):
+            internal_rank += _EXPIRY_REPLACEMENT_BONUS
+        scored.append((internal_rank, area_gain, edge_promise, gradient_promise, at, label))
 
     scored.sort(key=lambda t: t[0], reverse=True)
     # v9: break near-ties with the seeded rng so seats fan out onto different
@@ -742,7 +820,7 @@ def top_probe_hints(
     # bluesign so the menu isn't all-bluesign (see _MAX_BLUESIGN_PROBE_HINTS).
     hints: List[Dict[str, Any]] = []
     taken_disks: List[Set[Tuple[int, int]]] = []
-    deferred_bluesign: List[Tuple[Tuple[int, int], int, int, str, Set[Tuple[int, int]]]] = []
+    deferred_bluesign: List[Tuple[Tuple[int, int], int, int, int, str, Set[Tuple[int, int]]]] = []
     bluesign_taken = 0
 
     def _overlaps(disk_set: Set[Tuple[int, int]]) -> bool:
@@ -752,7 +830,8 @@ def top_probe_hints(
         )
 
     def _emit(at: Tuple[int, int], area_gain: int, edge_promise: int,
-              label: str, disk_set: Set[Tuple[int, int]]) -> None:
+              gradient_promise: int, label: str,
+              disk_set: Set[Tuple[int, int]]) -> None:
         contested = (
             label == "redsign"
             or any(c in _contested_redsign for c in disk_set)
@@ -762,6 +841,11 @@ def top_probe_hints(
             "at": [int(at[0]), int(at[1])],
             "area_gain": int(area_gain),
             "edge_promise": int(edge_promise),
+            # Phase 4 — separate field, same transparency philosophy as
+            # area_gain/edge_promise: no combined score, the LLM re-reads
+            # the parts. Non-zero means nearby visible mass/vein implies a
+            # pure is likely within the halo radius of this placement.
+            "gradient_promise": int(gradient_promise),
             "extends_from": label,
             # v9-only key (ignored by v6/v7/v8 formatters):
             "contested": bool(contested),
@@ -771,14 +855,16 @@ def top_probe_hints(
     # First pass — respect the bluesign cap so fog-exploration probes get
     # slots. Bluesign candidates beyond the cap are held back (deferred)
     # rather than dropped, so we can top up if nothing else qualifies.
-    for _rank, area_gain, edge_promise, at, label in scored:
+    for _rank, area_gain, edge_promise, gradient_promise, at, label in scored:
         disk_set = set(_disk(at[0], at[1], width, height))
         if _overlaps(disk_set):
             continue
         if label == "blue_sign" and bluesign_taken >= _MAX_BLUESIGN_PROBE_HINTS:
-            deferred_bluesign.append((at, area_gain, edge_promise, label, disk_set))
+            deferred_bluesign.append(
+                (at, area_gain, edge_promise, gradient_promise, label, disk_set)
+            )
             continue
-        _emit(at, area_gain, edge_promise, label, disk_set)
+        _emit(at, area_gain, edge_promise, gradient_promise, label, disk_set)
         if label == "blue_sign":
             bluesign_taken += 1
         if len(hints) >= max_hints:
@@ -786,10 +872,10 @@ def top_probe_hints(
 
     # Second pass — the cap left us short (board was mostly bluesign);
     # top up from the deferred bluesign candidates rather than waste slots.
-    for at, area_gain, edge_promise, label, disk_set in deferred_bluesign:
+    for at, area_gain, edge_promise, gradient_promise, label, disk_set in deferred_bluesign:
         if _overlaps(disk_set):
             continue
-        _emit(at, area_gain, edge_promise, label, disk_set)
+        _emit(at, area_gain, edge_promise, gradient_promise, label, disk_set)
         if len(hints) >= max_hints:
             break
 
@@ -1042,7 +1128,9 @@ def _orbit_harvester_ids(agent_view: Mapping[str, Any]) -> List[str]:
     return out
 
 
-def _friendly_probe_positions(agent_view: Mapping[str, Any]) -> List[Tuple[int, int]]:
+def _friendly_probe_positions(
+    agent_view: Mapping[str, Any], *, exclude_expiring: bool = False,
+) -> List[Tuple[int, int]]:
     """Return the (x, y) center of every currently-active friendly probe.
 
     Reads from ``agent_view.entities.mine`` (probes are entities of type
@@ -1054,6 +1142,13 @@ def _friendly_probe_positions(agent_view: Mapping[str, Any]) -> List[Tuple[int, 
     structurally — seeds within :data:`_MIN_PROBE_SEPARATION` of any
     active probe are dropped, so the compiler never suggests a probe
     that duplicates existing vision.
+
+    Phase 7 (IMPROVEMENT_STRATEGIES.md §3, probe expiry scheduling):
+    ``exclude_expiring=True`` also drops probes whose ``nights_remaining``
+    is within :data:`_PROBE_EXPIRY_SOON` — a probe that is about to lapse
+    should NOT block a nearby REPLACEMENT candidate the way a healthy
+    probe correctly does; the new probe is covering ground the old one
+    is seconds from losing, not duplicating live vision.
     """
     positions: List[Tuple[int, int]] = []
     for e in ((agent_view.get("entities") or {}).get("mine") or []):
@@ -1065,6 +1160,32 @@ def _friendly_probe_positions(agent_view: Mapping[str, Any]) -> List[Tuple[int, 
         nr = e.get("nights_remaining")
         if isinstance(nr, (int, float)) and int(nr) <= 0:
             continue
+        if (
+            exclude_expiring
+            and isinstance(nr, (int, float))
+            and 0 < int(nr) <= _PROBE_EXPIRY_SOON
+        ):
+            continue
+        if isinstance(pos, (list, tuple)) and len(pos) == 2:
+            try:
+                positions.append((int(pos[0]), int(pos[1])))
+            except (TypeError, ValueError):
+                continue
+    return positions
+
+
+def _expiring_friendly_probe_positions(
+    agent_view: Mapping[str, Any],
+) -> List[Tuple[int, int]]:
+    """Own probes with ``nights_remaining`` in ``(0, _PROBE_EXPIRY_SOON]``."""
+    positions: List[Tuple[int, int]] = []
+    for e in ((agent_view.get("entities") or {}).get("mine") or []):
+        if not isinstance(e, Mapping) or e.get("type") != "probe":
+            continue
+        nr = e.get("nights_remaining")
+        if not (isinstance(nr, (int, float)) and 0 < int(nr) <= _PROBE_EXPIRY_SOON):
+            continue
+        pos = e.get("pos") or e.get("at")
         if isinstance(pos, (list, tuple)) and len(pos) == 2:
             try:
                 positions.append((int(pos[0]), int(pos[1])))
