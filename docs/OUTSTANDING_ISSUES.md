@@ -1249,29 +1249,36 @@ refunded. A `[mineRetired]` log line reports both counts.
 
 ---
 
-## 27. 🔴 (OPEN) The heuristic stopped choosing a seam in `two_seams_choose_one`
+## 27. ✅ (RESOLVED — no longer reproduces) The heuristic stopped choosing a seam in `two_seams_choose_one`
 
-**Symptom:** `pytest` is one red at HEAD —
+**Original symptom:** `pytest` was one red at the version this issue was
+filed against —
 `tests/test_eval_scenarios.py::test_heuristic_passes_known_scenarios[two_seams_choose_one]`,
 failing `HarvesterChainHits: hit 0/1 of 3 target cells`. The agent still
-plans a sane-looking night: it walks `harvester_p1` from `[12,13]` out to
-`RED[15,15]` and drops both probes on fog clusters. It simply walks the
-*other* seam from the one the scenario is asserting on.
+planned a sane-looking night; it simply walked the *other* seam from the
+one the scenario asserts on.
 
-**Not from the tutorial work (v1.32/v1.33).** Confirmed by running the file
-in a clean worktree at HEAD: it fails there too, with none of the film or
-preset changes present. Everything else is green — 1209 passed.
+**Investigation (stark_direwolf improvement pass).** Re-ran the exact
+assertion at the current HEAD of this repo snapshot:
+`pytest tests/test_eval_scenarios.py::test_heuristic_passes_known_scenarios`
+— all 7 scenarios pass, including `two_seams_choose_one`, with no skip or
+xfail marker involved. Read the scenario (`sea_of_colours/evals/scenarios.py`,
+`two_seams_choose_one()`) against the question this issue asked first —
+"are the scenario's expected cells still the *better* seam under current
+pricing" — and confirmed they are: the west seam is genuinely 8 Manhattan
+steps out (outside the 5-step budget) and the east seam is 4 steps out
+(fits comfortably), both carrying identical value, so committing to the
+reachable east seam remains the objectively correct answer, not a stale
+fixture. The heuristic baseline now reaches it.
 
-**Where to start:** the three most recent heuristic commits are the
-suspects, and all three moved exactly the number this scenario measures —
-`9f555e5` (grade the ground around a jackpot, scale jackpots with the
-table), `d33b710` (price a blind seam from what seams actually measure),
-`92c0534` (last-night settlement). The question to answer first is whether
-the scenario's expected cells are still the *better* seam under the new
-pricing. If they are not, the fixture is stale and should be re-pinned
-with a note; if they are, the seam scorer is the bug. Do not "fix" it by
-loosening the assertion until that is settled — this scenario exists to
-catch the heuristic wandering.
+**Conclusion:** whatever combination of the three suspect commits named in
+the original filing (`9f555e5`, `d33b710`, `92c0534`) caused this, the
+seam scorer and the fixture agree again in this snapshot — nothing in this
+pass touched the shared heuristic baseline (`sea_of_colours/orchestrator_2/harnesses/*/`
+work this pass was fork-local to `stark_direwolf`), so this was already
+fixed upstream of this hackathon snapshot; the doc entry itself was simply
+never updated to DONE. No code change made — this section exists so the
+next reader isn't sent chasing a bug that no longer exists.
 
 ---
 
